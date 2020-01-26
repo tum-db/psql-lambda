@@ -54,6 +54,9 @@ exprType(const Node *expr)
 		case T_Const:
 			type = ((const Const *) expr)->consttype;
 			break;
+		case T_LambdaExpr:
+			type = LAMBDAOID;
+			break;
 		case T_Param:
 			type = ((const Param *) expr)->paramtype;
 			break;
@@ -129,6 +132,22 @@ exprType(const Node *expr)
 					/* MULTIEXPR is always considered to return RECORD */
 					type = RECORDOID;
 				}
+				else if (sublink->subLinkType == FUNC_SUBLINK)
+				{
+					/**
+					 * Subquery result will be passed as a tuplestore to a function.
+					 * The function will need to perform type checking itself.
+					 */
+					type = LAMBDATABLEOID;
+				}
+				else if (sublink->subLinkType == CURSOR_SUBLINK)
+				{
+					/**
+					 * Subquery result will be passed as a tuplestore to a function.
+					 * The function will need to perform type checking itself.
+					 */
+					type = LAMBDACURSOROID;
+				}
 				else
 				{
 					/* for all other sublink types, result is boolean */
@@ -159,6 +178,14 @@ exprType(const Node *expr)
 				{
 					/* MULTIEXPR is always considered to return RECORD */
 					type = RECORDOID;
+				}
+				else if(subplan->subLinkType == FUNC_SUBLINK)
+				{
+					/**
+					 * Subquery result will be passed as a tuplestore to a function.
+					 * The function will need to perform type checking itself.
+					 */
+					type = LAMBDATABLEOID;
 				}
 				else
 				{
@@ -284,6 +311,8 @@ exprTypmod(const Node *expr)
 			return ((const Var *) expr)->vartypmod;
 		case T_Const:
 			return ((const Const *) expr)->consttypmod;
+		case T_LambdaExpr:
+			return -1;
 		case T_Param:
 			return ((const Param *) expr)->paramtypmod;
 		case T_ArrayRef:
@@ -731,6 +760,9 @@ exprCollation(const Node *expr)
 			break;
 		case T_Const:
 			coll = ((const Const *) expr)->constcollid;
+			break;			
+		case T_LambdaExpr:
+			coll = InvalidOid;
 			break;
 		case T_Param:
 			coll = ((const Param *) expr)->paramcollid;
@@ -976,6 +1008,9 @@ exprSetCollation(Node *expr, Oid collation)
 		case T_Const:
 			((Const *) expr)->constcollid = collation;
 			break;
+		case T_LambdaExpr:
+			Assert(!OidIsValid(collation));
+			break;
 		case T_Param:
 			((Param *) expr)->paramcollid = collation;
 			break;
@@ -1202,6 +1237,9 @@ exprLocation(const Node *expr)
 			break;
 		case T_Const:
 			loc = ((const Const *) expr)->location;
+			break;
+		case T_LambdaExpr:
+			loc = ((const LambdaExpr *) expr)->location;
 			break;
 		case T_Param:
 			loc = ((const Param *) expr)->location;
@@ -1866,6 +1904,14 @@ expression_tree_walker(Node *node,
 		case T_SortGroupClause:
 			/* primitive node types with no expression subnodes */
 			break;
+		case T_LambdaExpr:
+			{
+				LambdaExpr  *le = (LambdaExpr *) node;
+
+				if (walker(le->expr, context))
+					return true;
+			}
+			break;
 		case T_WithCheckOption:
 			return walker(((WithCheckOption *) node)->qual, context);
 		case T_Aggref:
@@ -2502,6 +2548,18 @@ expression_tree_mutator(Node *node,
 				MUTATE(newnode->aggorder, aggref->aggorder, List *);
 				MUTATE(newnode->aggdistinct, aggref->aggdistinct, List *);
 				MUTATE(newnode->aggfilter, aggref->aggfilter, Expr *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_LambdaExpr:
+			{
+				LambdaExpr	   *le = (LambdaExpr *) node;
+				LambdaExpr	   *newnode;
+
+				FLATCOPY(newnode, le, LambdaExpr);
+				MUTATE(newnode->expr, le->expr, Expr *);
+				newnode->argtypes = list_copy(le->argtypes);
+				newnode->args = list_copy(le->args);
 				return (Node *) newnode;
 			}
 			break;

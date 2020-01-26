@@ -26,6 +26,15 @@
  * in C++ mode.
  */
 #ifdef __cplusplus
+
+
+
+#include <llvm/Pass.h>
+#include <llvm/IR/Function.h>
+#include <llvm/Support/raw_ostream.h>
+
+
+
 extern "C"
 {
 #endif
@@ -35,6 +44,7 @@ extern "C"
 #include "jit/jit.h"
 #include "nodes/pg_list.h"
 #include "access/tupdesc.h"
+#include "nodes/execnodes.h"
 
 
 typedef struct LLVMJitContext
@@ -47,6 +57,9 @@ typedef struct LLVMJitContext
 	/* current, "open for write", module */
 	LLVMModuleRef module;
 
+	/* copy of module in case multiple lambda funcs need to be emitted */
+	LLVMModuleRef moduleCopy;
+
 	/* is there any pending code that needs to be emitted */
 	bool		compiled;
 
@@ -55,10 +68,26 @@ typedef struct LLVMJitContext
 
 	/* list of handles for code emitted via Orc */
 	List	   *handles;
+
+	/* list of eval func names */
+	List 	   *funcnames;
+
+	/* list of simple eval func names */
+	List 	   *simpleFuncnames;
 } LLVMJitContext;
 
 
+
+typedef struct CompiledExprState
+{
+	LLVMJitContext *context;
+	const char *funcname;
+} CompiledExprState;
+
+
+
 /* type and struct definitions */
+extern LLVMTypeRef TypeDatum;
 extern LLVMTypeRef TypeParamBool;
 extern LLVMTypeRef TypePGFunction;
 extern LLVMTypeRef TypeSizeT;
@@ -91,11 +120,14 @@ extern LLVMValueRef FuncExecAggInitGroup;
 extern void llvm_enter_fatal_on_oom(void);
 extern void llvm_leave_fatal_on_oom(void);
 extern void llvm_reset_after_error(void);
+
 extern void llvm_assert_in_fatal_section(void);
 
 extern LLVMJitContext *llvm_create_context(int jitFlags);
 extern LLVMModuleRef llvm_mutable_module(LLVMJitContext *context);
-extern char *llvm_expand_funcname(LLVMJitContext *context, const char *basename);
+extern void llvm_enter_tmp_context(EState *state);
+extern void llvm_leave_tmp_context(EState *state);
+extern char *llvm_expand_funcname(LLVMJitContext *context, const char *basename, bool simple);
 extern void *llvm_get_function(LLVMJitContext *context, const char *funcname);
 extern void llvm_split_symbol_name(const char *name, char **modname, char **funcname);
 extern LLVMValueRef llvm_get_decl(LLVMModuleRef mod, LLVMValueRef f);
@@ -104,7 +136,9 @@ extern LLVMValueRef llvm_function_reference(LLVMJitContext *context,
 						LLVMBuilderRef builder,
 						LLVMModuleRef mod,
 						FunctionCallInfo fcinfo);
+extern Datum (*llvm_prepare_lambda_tablefunc(LLVMJitContext *context, char* bcModule,char* funcName, int numLambdas))(PG_FUNCTION_ARGS);
 
+extern Datum (*llvm_prepare_simple_expression(ExprState *state))(Datum **);
 extern void llvm_inline(LLVMModuleRef mod);
 
 /*
@@ -113,6 +147,7 @@ extern void llvm_inline(LLVMModuleRef mod);
  ****************************************************************************
  */
 extern bool llvm_compile_expr(struct ExprState *state);
+extern bool llvm_compile_simple_expr(struct ExprState *state);
 extern LLVMValueRef slot_compile_deform(struct LLVMJitContext *context, TupleDesc desc, int natts);
 
 /*

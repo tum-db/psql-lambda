@@ -18,6 +18,7 @@
 #define PRIMNODES_H
 
 #include "access/attnum.h"
+#include "access/tupdesc.h"
 #include "nodes/bitmapset.h"
 #include "nodes/pg_list.h"
 
@@ -250,6 +251,7 @@ typedef struct Param
 	int32		paramtypmod;	/* typmod value, if known */
 	Oid			paramcollid;	/* OID of collation, or InvalidOid if none */
 	int			location;		/* token location, or -1 if unknown */
+	bool  		lambda;         /* indicates whether used in lambda expr */
 } Param;
 
 /*
@@ -567,6 +569,40 @@ typedef struct BoolExpr
 	int			location;		/* token location, or -1 if unknown */
 } BoolExpr;
 
+
+
+/*
+ * LambdaExpr - a lambda expression.
+ *
+ * Lambda expressions are parsed as parts of table functions.
+ * Their argument and return types are determined by the subqueries passed
+ * to the table function along with the lambda expressions.
+ * Column refs inside the lambda expression are replaced by Param nodes
+ * of type PARAM_EXTERN. Upon function invocation in the executor stage,
+ * they will be populated with values of particular tuples provided by the
+ * table function.
+ *
+ * The argmap field is a list mapping each parameter id to the arg number
+ * it refers to.
+ */
+typedef struct LambdaExpr
+{
+	Expr		xpr;
+	List	   *args;			/* the arguments (list of row aliases) */
+	Expr	   *expr;			/* the lambda expression */
+	List       *argtypes;       /* list of TupleDescs describing the
+								   argument row types */
+	Oid        rettype;         /* return type of the lambda expression */
+	int        rettypmod;       /* return typmod of the lambda expression */
+	Node       *exprstate; 		/* ExprState for execution */ 
+	Node       *econtext; 		/* ExprContext for execution */ 
+	Node  	   *parentPlan; 	/* parent PlanState */ 
+	int			location;		/* token location, or -1 if unknown */
+} LambdaExpr;
+
+
+
+
 /*
  * SubLink
  *
@@ -580,6 +616,8 @@ typedef struct BoolExpr
  *	EXPR_SUBLINK		(SELECT with single targetlist item ...)
  *	MULTIEXPR_SUBLINK	(SELECT with multiple targetlist items ...)
  *	ARRAY_SUBLINK		ARRAY(SELECT with single targetlist item ...)
+ *  FUNC_SUBLINK		sublink for tablefuncs taking lambdatable arguments
+ *  CURSOR_SUBLINK		as FUNC_SUBLINK, but without materialization
  *	CTE_SUBLINK			WITH query (never actually part of an expression)
  * For ALL, ANY, and ROWCOMPARE, the lefthand is a list of expressions of the
  * same length as the subselect's targetlist.  ROWCOMPARE will *always* have
@@ -627,6 +665,8 @@ typedef enum SubLinkType
 	EXPR_SUBLINK,
 	MULTIEXPR_SUBLINK,
 	ARRAY_SUBLINK,
+	FUNC_SUBLINK,
+	CURSOR_SUBLINK,
 	CTE_SUBLINK					/* for SubPlans only */
 } SubLinkType;
 
@@ -748,6 +788,7 @@ typedef struct FieldSelect
 								 * node) */
 	int32		resulttypmod;	/* output typmod (usually -1) */
 	Oid			resultcollid;	/* OID of collation of the field */
+	TupleDesc	lambda;         /* TupleDesc of rowtype (only inside lambdas) */
 } FieldSelect;
 
 /* ----------------
@@ -1107,7 +1148,7 @@ typedef enum SQLValueFunctionOp
 	SVFOP_CURRENT_TIME,
 	SVFOP_CURRENT_TIME_N,
 	SVFOP_CURRENT_TIMESTAMP,
-	SVFOP_CURRENT_TIMESTAMP_N,
+    SVFOP_CURRENT_TIMESTAMP_N,
 	SVFOP_LOCALTIME,
 	SVFOP_LOCALTIME_N,
 	SVFOP_LOCALTIMESTAMP,

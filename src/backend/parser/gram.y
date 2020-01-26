@@ -1,6 +1,6 @@
 %{
 
-/*#define YYDEBUG 1*/
+#define YYDEBUG 1
 /*-------------------------------------------------------------------------
  *
  * gram.y
@@ -172,6 +172,7 @@ static void doNegateFloat(Value *v);
 static Node *makeAndExpr(Node *lexpr, Node *rexpr, int location);
 static Node *makeOrExpr(Node *lexpr, Node *rexpr, int location);
 static Node *makeNotExpr(Node *expr, int location);
+static Node *makeLambdaExpr(List *args, Node *expr, int location);
 static Node *makeAArrayExpr(List *elements, int location);
 static Node *makeSQLValueFunction(SQLValueFunctionOp op, int32 typmod,
 								  int location);
@@ -580,6 +581,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <str>			part_strategy
 %type <partelem>	part_elem
 %type <list>		part_params
+%type <list>		lambda_ident_list
 %type <partboundspec> PartitionBoundSpec
 %type <node>		partbound_datum PartitionRangeDatum
 %type <list>		hash_partbound partbound_datum_list range_datum_list
@@ -594,10 +596,10 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
  * DOT_DOT is unused in the core SQL grammar, and so will always provoke
  * parse errors.  It is needed by PL/pgSQL.
  */
-%token <str>	IDENT FCONST SCONST BCONST XCONST Op
+%token <str>	IDENT FCONST SCONST BCONST XCONST Op 
 %token <ival>	ICONST PARAM
 %token			TYPECAST DOT_DOT COLON_EQUALS EQUALS_GREATER
-%token			LESS_EQUALS GREATER_EQUALS NOT_EQUALS
+%token			LESS_EQUALS GREATER_EQUALS NOT_EQUALS LAMBDA_SIGN
 
 /*
  * If you want to make any keyword changes, update the keyword table in
@@ -648,7 +650,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 	KEY
 
-	LABEL LANGUAGE LARGE_P LAST_P LATERAL_P
+	LABEL LAMBDA LANGUAGE LARGE_P LAST_P LATERAL_P
 	LEADING LEAKPROOF LEAST LEFT LEVEL LIKE LIMIT LISTEN LOAD LOCAL
 	LOCALTIME LOCALTIMESTAMP LOCATION LOCK_P LOCKED LOGGED
 
@@ -752,7 +754,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
  * blame any funny behavior of UNBOUNDED on the SQL standard, though.
  */
 %nonassoc	UNBOUNDED		/* ideally should have same precedence as IDENT */
-%nonassoc	IDENT GENERATED NULL_P PARTITION RANGE ROWS GROUPS PRECEDING FOLLOWING CUBE ROLLUP
+%nonassoc	IDENT GENERATED NULL_P PARTITION RANGE ROWS GROUPS PRECEDING FOLLOWING CUBE ROLLUP 
 %left		Op OPERATOR		/* multi-character ops and user-defined operators */
 %left		'+' '-'
 %left		'*' '/' '%'
@@ -765,6 +767,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %left		'(' ')'
 %left		TYPECAST
 %left		'.'
+%nonassoc   LAMBDA_SIGN
 /*
  * These might seem to be low-precedence, but actually they are not part
  * of the arithmetic hierarchy at all in their use as JOIN operators.
@@ -3846,6 +3849,12 @@ ExclusionWhereClause:
 			WHERE '(' a_expr ')'					{ $$ = $3; }
 			| /*EMPTY*/								{ $$ = NULL; }
 		;
+
+
+lambda_ident_list:	ColId
+						{ $$ = list_make1(makeString($1)); }
+					| lambda_ident_list ',' ColId
+						{ $$ = lappend($1, makeString($3)); }
 
 /*
  * We combine the update and delete actions into one value temporarily
@@ -13340,6 +13349,17 @@ a_expr:		c_expr									{ $$ = $1; }
 					n->location = @1;
 					$$ = (Node *)n;
 				}
+
+
+			| LAMBDA_SIGN '(' lambda_ident_list ')' a_expr
+				{					
+					$$ = (Node*) makeLambdaExpr($3, $5, @1);
+				}
+
+			| LAMBDA '(' lambda_ident_list ')' a_expr
+				{					
+					$$ = (Node*) makeLambdaExpr($3, $5, @1);
+				}
 		;
 
 /*
@@ -15316,6 +15336,7 @@ col_name_keyword:
 			| INT_P
 			| INTEGER
 			| INTERVAL
+			| LAMBDA
 			| LEAST
 			| NATIONAL
 			| NCHAR
@@ -16016,6 +16037,17 @@ static Node *
 makeNotExpr(Node *expr, int location)
 {
 	return (Node *) makeBoolExpr(NOT_EXPR, list_make1(expr), location);
+}
+
+static Node *
+makeLambdaExpr(List *args, Node *expr, int location)
+{
+	LambdaExpr *n = makeNode(LambdaExpr);
+	n->args = args;
+	n->expr = (Expr *) expr;
+	n->location = location;
+
+	return (Node*) n;
 }
 
 static Node *

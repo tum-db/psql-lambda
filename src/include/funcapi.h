@@ -122,6 +122,8 @@ typedef struct FuncCallContext
 
 } FuncCallContext;
 
+
+
 /*----------
  *	Support to ease writing functions returning composite types
  *

@@ -90,7 +90,7 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc, int natts)
 
 	mod = llvm_mutable_module(context);
 
-	funcname = llvm_expand_funcname(context, "deform");
+	funcname = llvm_expand_funcname(context, "deform", false);
 
 	/*
 	 * Check which columns do have to exist, so we don't have to check the

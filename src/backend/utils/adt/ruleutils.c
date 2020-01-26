@@ -7446,6 +7446,7 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
 		case T_Var:
 		case T_Const:
 		case T_Param:
+		case T_LambdaExpr:
 		case T_CoerceToDomainValue:
 		case T_SetToDefault:
 		case T_CurrentOfExpr:

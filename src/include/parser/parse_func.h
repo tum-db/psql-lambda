@@ -30,6 +30,7 @@ typedef enum
 	FUNCDETAIL_COERCION			/* it's a type coercion request */
 } FuncDetailCode;
 
+extern Node *LambdaColumnRefHook(ParseState *pstate, ColumnRef *colref);
 
 extern Node *ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 				  Node *last_srf, FuncCall *fn, bool proc_call,

@@ -1,0 +1,5 @@
+# lambda extension
+comment = 'functions using lambda expressions'
+default_version = '1.0'
+module_pathname = '$libdir/lambda_ext'
+relocatable = true

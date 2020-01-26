@@ -77,6 +77,42 @@ l_int64_const(int64 i)
 }
 
 /*
+ * Bitcast to float8.
+ */
+static inline LLVMValueRef
+l_as_float8(LLVMBuilderRef b, LLVMValueRef v)
+{
+	return LLVMBuildBitCast(b, v, LLVMDoubleType(), "");
+}
+
+/*
+ * Bitcast to int4.
+ */
+static inline LLVMValueRef
+l_as_int4(LLVMBuilderRef b, LLVMValueRef v)
+{
+	return LLVMBuildTruncOrBitCast(b, v, LLVMInt32Type(), "");
+}
+
+/*
+ * Bitcast to int8.
+ */
+static inline LLVMValueRef
+l_as_int8(LLVMBuilderRef b, LLVMValueRef v)
+{
+	return LLVMBuildBitCast(b, v, LLVMInt64Type(), "");
+}
+
+/*
+ * Emit constant float8.
+ */
+static inline LLVMValueRef
+l_float8_const(float8 f)
+{
+	return LLVMConstReal(LLVMDoubleType(), f);
+}
+
+/*
  * Emit constant integer.
  */
 static inline LLVMValueRef

@@ -45,6 +45,7 @@
  * clang/LLVM will omit them.  As this file will never be linked into
  * anything, that's harmless.
  */
+Datum	    TypeDatum;
 PGFunction	TypePGFunction;
 size_t		TypeSizeT;
 bool		TypeStorageBool;
@@ -55,6 +56,7 @@ AggStatePerTransData StructAggStatePerTransData;
 ExprContext StructExprContext;
 ExprEvalStep StructExprEvalStep;
 ExprState	StructExprState;
+LambdaExpr	StructLambdaExpr;
 FunctionCallInfoData StructFunctionCallInfoData;
 HeapTupleData StructHeapTupleData;
 MemoryContextData StructMemoryContextData;

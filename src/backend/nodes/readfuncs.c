@@ -571,6 +571,7 @@ _readParam(void)
 	READ_INT_FIELD(paramid);
 	READ_OID_FIELD(paramtype);
 	READ_INT_FIELD(paramtypmod);
+	READ_BOOL_FIELD(lambda);
 	READ_OID_FIELD(paramcollid);
 	READ_LOCATION_FIELD(location);
 

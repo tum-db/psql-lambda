@@ -349,6 +349,7 @@ typedef struct ExprEvalStep
 		{
 			int			paramid;	/* numeric ID for parameter */
 			Oid			paramtype;	/* OID of parameter's datatype */
+			bool 		lambda;     /* use faster variant for lambdas */
 		}			param;
 
 		/* for EEOP_PARAM_CALLBACK */
@@ -468,6 +469,7 @@ typedef struct ExprEvalStep
 			Oid			resulttype; /* field's type */
 			/* cached tupdesc pointer - filled at runtime */
 			TupleDesc	argdesc;
+			bool        lambda;
 		}			fieldselect;
 
 		/* for EEOP_FIELDSTORE_DEFORM / FIELDSTORE_FORM */
@@ -673,7 +675,8 @@ typedef struct ArrayRefState
 	/* if we have a nested assignment, ARRAYREF_OLD puts old value here */
 	Datum		prevvalue;
 	bool		prevnull;
-} ArrayRefState;
+} ArrayRefState; 
+
 
 
 /* functions in execExpr.c */
@@ -684,6 +687,8 @@ extern void ExecReadyInterpretedExpr(ExprState *state);
 extern ExprEvalOp ExecEvalStepOp(ExprState *state, ExprEvalStep *op);
 
 extern Datum ExecInterpExprStillValid(ExprState *state, ExprContext *econtext, bool *isNull);
+extern Datum ExecEvalLambdaExpr(ExprState *state, ExprContext *econtext, bool *isnull, int index);
+extern Datum ExecEvalSimpleLambdaExpr(Datum **args, int index); 
 extern void CheckExprStillValid(ExprState *state, ExprContext *econtext);
 
 /*
@@ -699,6 +704,8 @@ extern void ExecEvalParamExec(ExprState *state, ExprEvalStep *op,
 				  ExprContext *econtext);
 extern void ExecEvalParamExtern(ExprState *state, ExprEvalStep *op,
 					ExprContext *econtext);
+extern void ExecEvalFastParamExtern(ExprState *state, ExprEvalStep *op,
+					ExprContext *econtext);
 extern void ExecEvalSQLValueFunction(ExprState *state, ExprEvalStep *op);
 extern void ExecEvalCurrentOfExpr(ExprState *state, ExprEvalStep *op);
 extern void ExecEvalNextValueExpr(ExprState *state, ExprEvalStep *op);
@@ -712,6 +719,10 @@ extern void ExecEvalArrayCoerce(ExprState *state, ExprEvalStep *op,
 extern void ExecEvalRow(ExprState *state, ExprEvalStep *op);
 extern void ExecEvalMinMax(ExprState *state, ExprEvalStep *op);
 extern void ExecEvalFieldSelect(ExprState *state, ExprEvalStep *op,
+					ExprContext *econtext);
+extern void ExecEvalFastFieldSelect(ExprState *state, ExprEvalStep *op,
+					ExprContext *econtext);
+extern void ExecEvalFastDatumExtract(ExprState *state, ExprEvalStep *op,
 					ExprContext *econtext);
 extern void ExecEvalFieldStoreDeForm(ExprState *state, ExprEvalStep *op,
 						 ExprContext *econtext);

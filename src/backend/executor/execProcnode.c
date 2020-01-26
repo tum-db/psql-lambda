@@ -365,7 +365,7 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 			break;
 
 		default:
-			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
+			elog(ERROR, "!unrecognized node type: %d", (int) nodeTag(node));
 			result = NULL;		/* keep compiler quiet */
 			break;
 	}

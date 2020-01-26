@@ -48,15 +48,8 @@
 #include "utils/xml.h"
 
 
-typedef struct CompiledExprState
-{
-	LLVMJitContext *context;
-	const char *funcname;
-} CompiledExprState;
-
 
 static Datum ExecRunCompiledExpr(ExprState *state, ExprContext *econtext, bool *isNull);
-
 static LLVMValueRef BuildV1Call(LLVMJitContext *context, LLVMBuilderRef b,
 			LLVMModuleRef mod, FunctionCallInfo fcinfo,
 			LLVMValueRef *v_fcinfo_isnull);
@@ -64,7 +57,67 @@ static void build_EvalXFunc(LLVMBuilderRef b, LLVMModuleRef mod,
 				const char *funcname,
 				LLVMValueRef v_state, LLVMValueRef v_econtext,
 				ExprEvalStep *op);
+static LLVMValueRef build_EvalCFunc(LLVMBuilderRef b, LLVMModuleRef mod,
+				const char *funcname, LLVMValueRef *params,
+				LLVMTypeRef *param_types, LLVMTypeRef rettype, int nparams);
 static LLVMValueRef create_LifetimeEnd(LLVMModuleRef mod);
+
+#define CASE_FLOAT8_CFUNC_2ARG(oid, fname) case oid: \
+		{ \
+			LLVMTypeRef types[2]; \
+			LLVMValueRef params[2]; \
+			numparams = 2;	\
+			types[0] = LLVMDoubleType(); \
+			types[1] = LLVMDoubleType(); \
+			params[0] = l_as_float8(b, registers[registerPointer - 2]); \
+			params[1] = l_as_float8(b, registers[registerPointer - 1]); \
+\
+			opres = build_EvalCFunc(b, mod, fname, (LLVMValueRef *) &params \
+				, (LLVMTypeRef *) &types, types[0], 2); \
+			break; \
+		}
+
+
+#define CASE_INT4_CFUNC_2ARG(oid, fname) case oid: \
+		{ \
+			LLVMTypeRef types[2]; \
+			LLVMValueRef params[2]; \
+			numparams = 2;	\
+			types[0] = LLVMInt32Type(); \
+			types[1] = LLVMInt32Type(); \
+			params[0] = l_as_int4(b, registers[registerPointer - 2]); \
+			params[1] = l_as_int4(b, registers[registerPointer - 1]); \
+\
+			opres = build_EvalCFunc(b, mod, fname, (LLVMValueRef *) &params \
+				, (LLVMTypeRef *) &types, types[0], 2); \
+			break; \
+		}
+
+#define CASE_FLOAT8_CFUNC_1ARG(oid, fname) case oid: \
+		{ \
+			LLVMTypeRef types[1]; \
+			LLVMValueRef params[1]; \
+			numparams = 1;	\
+			types[0] = LLVMDoubleType(); \
+			params[0] = l_as_float8(b, registers[registerPointer - 1]); \
+\
+			opres = build_EvalCFunc(b, mod, fname, (LLVMValueRef *) &params, \
+				(LLVMTypeRef *) &types, types[0], 1); \
+			break; \
+		}
+
+#define CASE_INT4_CFUNC_1ARG(oid, fname) case oid: \
+		{ \
+			LLVMTypeRef types[1]; \
+			LLVMValueRef params[1]; \
+			numparams = 1;	\
+			types[0] = LLVMInt32Type(); \
+			params[0] = l_as_int4(b, registers[registerPointer - 1]); \
+\
+			opres = build_EvalCFunc(b, mod, fname, (LLVMValueRef *) &params, \
+				(LLVMTypeRef *) &types, types[0], 1); \
+			break; \
+		}
 
 
 /*
@@ -144,7 +197,7 @@ llvm_compile_expr(ExprState *state)
 
 	b = LLVMCreateBuilder();
 
-	funcname = llvm_expand_funcname(context, "evalexpr");
+	funcname = llvm_expand_funcname(context, "evalexpr", false);
 
 	/* Create the signature and function */
 	{
@@ -1154,8 +1207,17 @@ llvm_compile_expr(ExprState *state)
 				break;
 
 			case EEOP_PARAM_EXTERN:
-				build_EvalXFunc(b, mod, "ExecEvalParamExtern",
+				if (op->d.param.lambda)
+				{
+					build_EvalXFunc(b, mod, "ExecEvalFastParamExtern",
 								v_state, v_econtext, op);
+				} 
+				else 
+				{
+					build_EvalXFunc(b, mod, "ExecEvalParamExtern",
+								v_state, v_econtext, op);
+				}
+				
 				LLVMBuildBr(b, opblocks[i + 1]);
 				break;
 
@@ -1851,8 +1913,15 @@ llvm_compile_expr(ExprState *state)
 				break;
 
 			case EEOP_FIELDSELECT:
-				build_EvalXFunc(b, mod, "ExecEvalFieldSelect",
+				if (!op->d.fieldselect.lambda)
+				{
+					build_EvalXFunc(b, mod, "ExecEvalFieldSelect",
 								v_state, v_econtext, op);
+				} else {
+					build_EvalXFunc(b, mod, "ExecEvalFastFieldSelect",
+								v_state, v_econtext, op);
+				}
+
 				LLVMBuildBr(b, opblocks[i + 1]);
 				break;
 
@@ -2565,6 +2634,333 @@ llvm_compile_expr(ExprState *state)
 	return true;
 }
 
+
+/*
+ * Fast JIT compilation for a small subset of opcodes.
+ * 
+ * To reduce overhead caused by the various error reporting and type checking
+ * routines in the internal Postgres functions, this procedure performs some
+ * very efficient low-level JIT-compilation for integers and doubles with
+ * basic arithmetic operators and common functions such as sqrt, abs and pow.
+ *
+ * More complex datatypes, such as strings, arrays, numeric, etc. are not supported.
+ * 
+ * The generated function takes a **Datum parameter: The first indirection selects
+ * the rowtype argument and the second indirection refers to an actual value of 
+ * the row.
+ */
+bool
+llvm_compile_simple_expr(ExprState *state)
+{
+	PlanState  *parent = state->parent;
+	int			i;
+	char	   *funcname;
+
+	LLVMJitContext *context = NULL;
+
+	LLVMBuilderRef b;
+	LLVMModuleRef mod;
+	LLVMTypeRef eval_sig;
+	LLVMValueRef eval_fn;
+	LLVMValueRef datum_param;
+	LLVMBasicBlockRef entry;
+	LLVMBasicBlockRef *opblocks;
+	LLVMValueRef registers[50];
+	int registerPointer = 0;
+
+
+	instr_time	starttime;
+	instr_time	endtime;
+
+	llvm_enter_fatal_on_oom();
+
+	/* get or create JIT context */
+	if (parent && parent->state->es_jit)
+	{
+		context = (LLVMJitContext *) parent->state->es_jit;
+	}
+	else
+	{
+		context = llvm_create_context(parent->state->es_jit_flags);
+
+		if (parent)
+		{
+			parent->state->es_jit = &context->base;
+		}
+	}
+
+	INSTR_TIME_SET_CURRENT(starttime);
+
+	mod = llvm_mutable_module(context);
+
+	b = LLVMCreateBuilder();
+
+	funcname = llvm_expand_funcname(context, "evalexpr", true);
+
+	/* Create the signature and function */
+	{
+		LLVMTypeRef param_types[1];
+
+		param_types[0] = l_ptr(l_ptr(TypeDatum));	/* state */
+
+		eval_sig = LLVMFunctionType(TypeDatum,
+									param_types, lengthof(param_types),
+									false);
+	}
+
+	eval_fn = LLVMAddFunction(mod, funcname, eval_sig);
+	LLVMSetLinkage(eval_fn, LLVMExternalLinkage);
+	LLVMSetVisibility(eval_fn, LLVMDefaultVisibility);
+
+	entry = LLVMAppendBasicBlock(eval_fn, "entry");
+
+
+	LLVMPositionBuilderAtEnd(b, entry);
+
+	/* allocate blocks for each op upfront, so we can do jumps easily */
+	opblocks = palloc(sizeof(LLVMBasicBlockRef));
+	opblocks[0] = l_bb_append_v(eval_fn, "b.op.start");
+
+	/* jump from entry to first block */
+	LLVMBuildBr(b, opblocks[0]);
+
+	datum_param = LLVMGetParam(eval_fn, 0);
+		LLVMPositionBuilderAtEnd(b, opblocks[0]);
+
+	for (i = 0; i < state->steps_len; i++)
+	{
+		ExprEvalStep *op;
+		ExprEvalOp	opcode;
+		LLVMValueRef v_opval;
+
+		op = &state->steps[i];
+		opcode = ExecEvalStepOp(state, op);
+
+
+		switch (opcode)
+		{
+			case EEOP_DONE:
+				{
+					LLVMBuildRet(b, LLVMBuildZExtOrBitCast(b, registers[registerPointer - 1], TypeDatum, ""));
+					break;
+				}
+
+
+			case EEOP_CONST:
+				{
+					printf("Const: %lu %i %f\n", DatumGetInt64(op->d.constval.value), DatumGetInt32(op->d.constval.value), DatumGetFloat8(op->d.constval.value));
+					registers[registerPointer++] = l_sizet_const(op->d.constval.value);
+					break;
+				}
+
+			case EEOP_FUNCEXPR_STRICT:
+			case EEOP_FUNCEXPR:
+				{
+					char *funcname;
+					int numparams;
+
+					LLVMValueRef opres;
+					FunctionCallInfo fcinfo = op->d.func.fcinfo_data;
+					printf("Op: %i\n", fcinfo->flinfo->fn_oid);
+					switch (fcinfo->flinfo->fn_oid)
+					{
+						case 141:
+							numparams = 2;
+							opres = LLVMBuildBinOp(b, LLVMMul,
+								l_as_int4(b, registers[registerPointer - 2]), 
+								l_as_int4(b, registers[registerPointer - 1]),
+								"imul");
+							break;
+
+						case 154:	
+							numparams = 2;						
+							opres = LLVMBuildBinOp(b, LLVMSDiv,
+								l_as_int4(b, registers[registerPointer - 2]), 
+								l_as_int4(b, registers[registerPointer - 1]),
+								"idiv");
+							break;
+
+						case 177:	
+							numparams = 2;	
+							opres = LLVMBuildBinOp(b, LLVMAdd,
+								l_as_int4(b, registers[registerPointer - 2]), 
+								l_as_int4(b, registers[registerPointer - 1]),
+								"iadd");
+							break;
+
+						case 181:	
+							numparams = 2;	
+							opres = LLVMBuildBinOp(b, LLVMSub,
+								l_as_int4(b, registers[registerPointer - 2]), 
+								l_as_int4(b, registers[registerPointer - 1]),
+								"isub");
+							break;
+
+						case 212:	
+							numparams = 1;	
+							opres = LLVMBuildNeg(b, l_as_int4(b, registers[registerPointer - 1]),
+								"int4um");
+							break;
+
+
+						case 1726:
+						case 216:
+							numparams = 2;
+							opres = LLVMBuildBinOp(b, LLVMFMul,
+								l_as_float8(b, registers[registerPointer - 2]), 
+								l_as_float8(b, registers[registerPointer - 1]),
+								"fmul");
+							printf("Ptr: %i\n", registerPointer);
+							break;
+
+						case 1727:
+						case 217:	
+							numparams = 2;						
+							opres = LLVMBuildBinOp(b, LLVMFDiv,
+								l_as_float8(b, registers[registerPointer - 2]), 
+								l_as_float8(b, registers[registerPointer - 1]),
+								"fdiv");
+							break;
+
+						case 1724:
+						case 218:	
+							numparams = 2;	
+							opres = LLVMBuildBinOp(b, LLVMFAdd,
+								l_as_float8(b, registers[registerPointer - 2]), 
+								l_as_float8(b, registers[registerPointer - 1]),
+								"fadd");
+							break;
+
+						case 1725:
+						case 219:	
+							numparams = 2;	
+							opres = LLVMBuildBinOp(b, LLVMFSub,
+								l_as_float8(b, registers[registerPointer - 2]), 
+								l_as_float8(b, registers[registerPointer - 1]),
+								"fsub");
+							break;
+
+						case 220:	
+							numparams = 1;	
+							opres = LLVMBuildNeg(b, l_as_float8(b, registers[registerPointer - 1]),
+								"float_um");
+							break;
+
+						case 316:
+						case 1740:	
+							numparams = 1;	
+							opres = LLVMBuildCast(b, LLVMSIToFP, l_as_int4(b, registers[registerPointer - 1]),
+								LLVMDoubleType(), "int4_to_float8");
+							break;
+
+						case 317:
+						case 1744:	
+							numparams = 1;	
+							opres = LLVMBuildCast(b, LLVMFPToSI, l_as_float8(b, registers[registerPointer - 1]),
+								LLVMInt32Type(), "float_to_int4");
+							break;
+
+						case 483:
+						case 1781:	
+							numparams = 1;	
+							opres = LLVMBuildCast(b, LLVMFPToSI, l_as_float8(b, registers[registerPointer - 1]),
+								LLVMInt64Type(), "float8_to_int8");
+							break;
+
+						case 1746:
+						case 1743:	
+							numparams = 1;	
+							opres = registers[registerPointer - 1];
+							break;
+
+						CASE_FLOAT8_CFUNC_1ARG(221, "fabs")
+						CASE_FLOAT8_CFUNC_1ARG(1395, "fabs")
+						CASE_FLOAT8_CFUNC_1ARG(230, "sqrt")
+						CASE_FLOAT8_CFUNC_2ARG(232, "pow")
+						CASE_FLOAT8_CFUNC_1ARG(1600, "asin")
+						CASE_FLOAT8_CFUNC_1ARG(1601, "acos")
+						CASE_FLOAT8_CFUNC_1ARG(1602, "atan")
+						CASE_FLOAT8_CFUNC_2ARG(1603, "atan2")
+						CASE_FLOAT8_CFUNC_1ARG(1604, "sin")
+						CASE_FLOAT8_CFUNC_1ARG(1605, "cos")
+						CASE_FLOAT8_CFUNC_1ARG(1606, "tan")
+						CASE_FLOAT8_CFUNC_1ARG(1607, "cot")
+						CASE_FLOAT8_CFUNC_1ARG(1339, "log10")
+						CASE_FLOAT8_CFUNC_1ARG(1341, "log")
+						CASE_FLOAT8_CFUNC_1ARG(1344, "sqrt")
+						CASE_FLOAT8_CFUNC_2ARG(1346, "pow")
+						CASE_FLOAT8_CFUNC_1ARG(1347, "exp")
+
+						default:
+							ereport(ERROR,
+				            (errcode(ERRCODE_INTERNAL_ERROR),
+				             errmsg("Function with Oid %i has no fast JIT implementation.", fcinfo->flinfo->fn_oid)));
+							break;
+					}
+
+					registerPointer -= numparams;
+					registers[registerPointer++] = opres;
+
+					break;
+				}
+
+			case EEOP_PARAM_EXTERN:
+				{
+					printf("Extern\n");
+					LLVMValueRef addr = l_int32_const(op->d.param.paramid - 1);
+
+					registers[registerPointer++] = LLVMBuildLoad(b, LLVMBuildGEP(b, datum_param,
+								&addr, 1, ""), "");
+					break;
+				}
+
+			case EEOP_FIELDSELECT:
+				{printf("FieldSelect\n");
+					LLVMValueRef addr = l_int32_const(op->d.fieldselect.fieldnum - 1);
+
+					registers[registerPointer - 1] = LLVMBuildLoad(b, LLVMBuildGEP(b, registers[registerPointer - 1],
+								&addr, 1, ""), "");
+					break;
+				}
+					
+			case EEOP_LAST:
+				Assert(false);
+				break;
+
+			default:
+				ereport(ERROR,
+	            (errcode(ERRCODE_INTERNAL_ERROR),
+	             errmsg("Opcode %i cannot be JIT-compiled with llvm_compile_simple_expr", opcode)));
+				break;
+		}
+	}
+
+	LLVMDisposeBuilder(b);
+
+	/*
+	 * Don't immediately emit function, instead do so the first time the
+	 * expression is actually evaluated. That allows to emit a lot of
+	 * functions together, avoiding a lot of repeated llvm and memory
+	 * remapping overhead.
+	 */
+	{
+		CompiledExprState *cstate = palloc0(sizeof(CompiledExprState));
+
+		cstate->context = context;
+		cstate->funcname = funcname;
+
+		state->evalfunc_simple_private = cstate;
+	}
+
+	llvm_leave_fatal_on_oom();
+
+	INSTR_TIME_SET_CURRENT(endtime);
+	INSTR_TIME_ACCUM_DIFF(context->base.instr.generation_counter,
+						  endtime, starttime);
+
+	return true;
+}
+
 /*
  * Run compiled expression.
  *
@@ -2673,6 +3069,32 @@ build_EvalXFunc(LLVMBuilderRef b, LLVMModuleRef mod, const char *funcname,
 	LLVMBuildCall(b,
 				  v_fn,
 				  params, lengthof(params), "");
+}
+
+/*
+ * Implement an expression step by calling the function funcname
+ * with custom params.
+ */
+static LLVMValueRef
+build_EvalCFunc(LLVMBuilderRef b, LLVMModuleRef mod,
+				const char *funcname, LLVMValueRef *params,
+				LLVMTypeRef *param_types, LLVMTypeRef rettype, int nparams)
+{
+	LLVMTypeRef sig;
+	LLVMValueRef v_fn;
+
+	v_fn = LLVMGetNamedFunction(mod, funcname);
+	if (!v_fn)
+	{
+		sig = LLVMFunctionType(rettype,
+							   param_types, nparams,
+							   false);
+		v_fn = LLVMAddFunction(mod, funcname, sig);
+	}
+
+	return LLVMBuildCall(b,
+				  v_fn,
+				  params, nparams, "");
 }
 
 static LLVMValueRef

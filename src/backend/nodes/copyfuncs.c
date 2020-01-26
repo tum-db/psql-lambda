@@ -1414,6 +1414,29 @@ _copyParam(const Param *from)
 	COPY_SCALAR_FIELD(paramtype);
 	COPY_SCALAR_FIELD(paramtypmod);
 	COPY_SCALAR_FIELD(paramcollid);
+	COPY_SCALAR_FIELD(lambda);
+	COPY_LOCATION_FIELD(location);
+
+	return newnode;
+}
+
+/*
+ * _copyLambdaExpr
+ */
+static LambdaExpr *
+_copyLambdaExpr(const LambdaExpr *from)
+{
+	LambdaExpr	   *newnode = makeNode(LambdaExpr);
+
+	COPY_SCALAR_FIELD(rettype);
+	COPY_SCALAR_FIELD(rettypmod);
+	COPY_NODE_FIELD(expr);
+	COPY_NODE_FIELD(exprstate);
+	COPY_NODE_FIELD(parentPlan);
+	COPY_NODE_FIELD(econtext);
+	COPY_NODE_FIELD(args);
+	newnode->argtypes = list_copy(from->argtypes);
+
 	COPY_LOCATION_FIELD(location);
 
 	return newnode;
@@ -1709,6 +1732,7 @@ _copyFieldSelect(const FieldSelect *from)
 	COPY_SCALAR_FIELD(resulttype);
 	COPY_SCALAR_FIELD(resulttypmod);
 	COPY_SCALAR_FIELD(resultcollid);
+	COPY_SCALAR_FIELD(lambda);
 
 	return newnode;
 }
@@ -4958,6 +4982,9 @@ copyObjectImpl(const void *from)
 			break;
 		case T_Aggref:
 			retval = _copyAggref(from);
+			break;
+		case T_LambdaExpr:
+			retval = _copyLambdaExpr(from);
 			break;
 		case T_GroupingFunc:
 			retval = _copyGroupingFunc(from);

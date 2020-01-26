@@ -120,6 +120,8 @@ parse_analyze(RawStmt *parseTree, const char *sourceText,
 
 	free_parsestate(pstate);
 
+	printf("Parsing done.\n");
+
 	return query;
 }
 

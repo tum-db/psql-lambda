@@ -360,6 +360,7 @@ typedef struct FuncCall
 	int			location;		/* token location, or -1 if unknown */
 } FuncCall;
 
+
 /*
  * A_Star - '*' representing all columns of a table or compound field
  *

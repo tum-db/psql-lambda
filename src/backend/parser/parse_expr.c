@@ -295,6 +295,15 @@ transformExprRecurse(ParseState *pstate, Node *expr)
 			result = transformRowExpr(pstate, (RowExpr *) expr, false);
 			break;
 
+		case T_LambdaExpr:
+			/* Lambda should have been processed by a function call already. */
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("lambda expressions are not allowed in this context"),
+					 parser_errposition(pstate,
+										((LambdaExpr *) expr)->location)));
+			break;
+
 		case T_CoalesceExpr:
 			result = transformCoalesceExpr(pstate, (CoalesceExpr *) expr);
 			break;
@@ -531,7 +540,7 @@ transformColumnRef(ParseState *pstate, ColumnRef *cref)
 		node = pstate->p_pre_columnref_hook(pstate, cref);
 		if (node != NULL)
 			return node;
-	}
+	} 
 
 	/*----------
 	 * The allowed syntaxes are:
@@ -1443,7 +1452,9 @@ transformBoolExpr(ParseState *pstate, BoolExpr *a)
 static Node *
 transformFuncCall(ParseState *pstate, FuncCall *fn)
 {
+	Query      *qtree;
 	Node	   *last_srf = pstate->p_last_srf;
+	Node	   *argnode;
 	List	   *targs;
 	ListCell   *args;
 
@@ -1451,8 +1462,51 @@ transformFuncCall(ParseState *pstate, FuncCall *fn)
 	targs = NIL;
 	foreach(args, fn->args)
 	{
-		targs = lappend(targs, transformExprRecurse(pstate,
+		bool       containsSublinkExpr = false;
+		argnode = (Node *) lfirst(args);
+
+		if (IsA(argnode, NamedArgExpr)) {
+			NamedArgExpr *na = (NamedArgExpr *) argnode;
+			argnode = (Node *) na->arg;
+		}
+
+		if (IsA(argnode, SubLink)) {
+			SubLink* subLink = (SubLink *) argnode;
+			
+			/*
+			 * The sublink expr could possibly be a LAMBDATABLE or LAMBDACURSOR expr,
+			 * therefore we need to avoid parse errors by temporarily treating
+			 * multi-column EXPR_SUBLINKS as FUNC_SUBLINKS (which do not restrict the
+			 * number of sublink output columns).
+			 * ParseFuncOrColumn will later decide which sublink type applies.
+			 */
+			if(subLink->subLinkType == EXPR_SUBLINK) {
+				containsSublinkExpr = true;
+				subLink->subLinkType = FUNC_SUBLINK;
+				targs = lappend(targs, transformExprRecurse(pstate,
 													(Node *) lfirst(args)));
+
+				qtree = castNode(Query, subLink->subselect);
+
+				/*
+				 * Change back to EXPR_SUBLINK if col count is 1
+				 * such that type inference works for this case. It will be
+				 * changed to FUNC_SUBLINK / CURSOR_SUBLINK later during argument
+				 * coercion in case the target parameter type is LAMBDATABLE or
+				 * LAMBDACURSOR.
+				 */
+				if (count_nonjunk_tlist_entries(qtree->targetList) == 1) {
+					subLink->subLinkType = EXPR_SUBLINK;
+				}
+			}
+		
+		}
+
+		if (IsA(argnode, LambdaExpr))			
+			targs = lappend(targs, (Node *) lfirst(args));
+		else if (!containsSublinkExpr)
+			targs = lappend(targs, transformExprRecurse(pstate,
+											(Node *) lfirst(args)));
 	}
 
 	/*
@@ -1846,6 +1900,9 @@ transformSubLink(ParseState *pstate, SubLink *sublink)
 		case EXPR_KIND_PARTITION_EXPRESSION:
 			err = _("cannot use subquery in partition key expression");
 			break;
+		case EXPR_KIND_LAMBDA_EXPRESSION:
+			err = _("cannot use subquery in LAMBDA expression");
+			break;
 		case EXPR_KIND_CALL_ARGUMENT:
 			err = _("cannot use subquery in CALL argument");
 			break;
@@ -1910,7 +1967,7 @@ transformSubLink(ParseState *pstate, SubLink *sublink)
 		sublink->testexpr = NULL;
 		sublink->operName = NIL;
 	}
-	else if (sublink->subLinkType == MULTIEXPR_SUBLINK)
+	else if (sublink->subLinkType == MULTIEXPR_SUBLINK || sublink->subLinkType == FUNC_SUBLINK)
 	{
 		/* Same as EXPR case, except no restriction on number of columns */
 		sublink->testexpr = NULL;
@@ -3475,6 +3532,8 @@ ParseExprKindName(ParseExprKind exprKind)
 			return "PARTITION BY";
 		case EXPR_KIND_CALL_ARGUMENT:
 			return "CALL";
+		case EXPR_KIND_LAMBDA_EXPRESSION:
+			return "LAMBDA";
 
 			/*
 			 * There is intentionally no default: case here, so that the

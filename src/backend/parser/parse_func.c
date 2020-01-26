@@ -43,6 +43,83 @@ static Node *ParseComplexProjection(ParseState *pstate, const char *funcname,
 					   Node *first_arg, int location);
 
 
+Node *
+LambdaColumnRefHook(ParseState *pstate, ColumnRef *colref)
+{
+	Value* aliasName;
+	Value* colName;
+	TupleDesc lti;
+	FieldSelect* fs;
+	Param* param;
+	Form_pg_attribute attr = NULL;
+
+	int idx1, idx2;
+
+	if(list_length(colref->fields) != 2)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+				 errmsg("invalid column reference inside lambda expression"),
+				 errhint("Use <tablealias>.<colname>"),
+				 parser_errposition(pstate,
+									(colref->location))));
+	}
+
+	aliasName = linitial_node(Value, colref->fields);
+	colName = lsecond_node(Value, colref->fields);
+
+	idx1 = list_index(pstate->p_current_lambda->args, aliasName);
+
+	if (idx1 < 0)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+				 errmsg("undefined argument inside lambda expression"),
+				 parser_errposition(pstate,
+									(colref->location))));
+	}
+
+	lti = (TupleDesc) list_nth(pstate->p_current_lambda->argtypes, idx1);
+
+	for (idx2 = 0; idx2 < lti->natts; idx2++)
+	{
+		attr = TupleDescAttr(lti, idx2);
+
+		if (strcmp(NameStr(attr->attname), strVal(colName)) == 0)
+		{
+			break;
+		}
+	}
+
+	if (idx2 == lti->natts)
+	{		
+		ereport(ERROR, 
+				(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+				 errmsg("column \"%s\" does not exist", strVal(colName)),
+				 parser_errposition(pstate,
+									(colref->location))));
+	}
+
+	fs = makeNode(FieldSelect);
+	param = makeNode(Param);
+
+	param->paramkind = PARAM_EXTERN;
+	param->paramid = idx1 + 1;
+	param->paramtype = RECORDOID;
+	param->paramcollid = InvalidOid;
+	param->location = -1;
+	param->lambda = true;
+
+	fs->arg = (Expr *) param;
+	fs->fieldnum = idx2 + 1;
+	fs->resulttype = attr->atttypid;
+	fs->resulttypmod = attr->atttypmod;
+	fs->resultcollid = attr->attcollation;
+	fs->lambda = lti;
+
+	return (Node *) fs;
+}
+
 /*
  *	Parse a function call
  *
@@ -80,6 +157,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 {
 	bool		is_column = (fn == NULL);
 	List	   *agg_order = (fn ? fn->agg_order : NIL);
+	List 	   *ltiList = NIL;
 	Expr	   *agg_filter = NULL;
 	bool		agg_within_group = (fn ? fn->agg_within_group : false);
 	bool		agg_star = (fn ? fn->agg_star : false);
@@ -88,6 +166,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	WindowDef  *over = (fn ? fn->over : NULL);
 	bool		could_be_projection;
 	Oid			rettype;
+	PreParseColumnRefHook oldColumnRefHook;
 	Oid			funcid;
 	ListCell   *l;
 	ListCell   *nextl;
@@ -105,6 +184,8 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	FuncDetailCode fdresult;
 	char		aggkind = 0;
 	ParseCallbackState pcbstate;
+
+	printf("Parsing func\n");
 
 	/*
 	 * If there's an aggregate filter, transform it using transformWhereClause
@@ -726,6 +807,95 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	/* if it returns a set, check that's OK */
 	if (retset)
 		check_srf_call_placement(pstate, last_srf, location);
+
+	/* perform transformation, type inference and validation for lambdas */
+	foreach(l, fargs)
+	{
+		Node * arg = (Node *) lfirst(l);
+
+		if (IsA(arg, SubLink))
+		{
+			int idx = 0;
+			ListCell *n;
+			TargetEntry *tent;
+			SubLink *sublink = castNode(SubLink, arg);
+			Query *qtree = castNode(Query, sublink->subselect);
+			TupleDesc tupdesc = CreateTemplateTupleDesc(
+				list_length(qtree->targetList), false);
+
+			foreach(n, qtree->targetList)
+			{
+				tent = castNode(TargetEntry, lfirst(n));
+
+				if (tent->resjunk)
+					continue;
+
+				TupleDescInitEntry(tupdesc, (AttrNumber) (++idx),
+                        tent->resname, exprType((Node *) tent->expr),
+                        exprTypmod((Node *) tent->expr), 0);
+			}
+
+			ltiList = lappend(ltiList, tupdesc);
+		}
+	}
+
+	oldColumnRefHook = pstate->p_pre_columnref_hook;
+	pstate->p_pre_columnref_hook = LambdaColumnRefHook;
+
+	if (list_length(ltiList) > 0)
+	{
+		foreach(l, fargs)
+		{
+			ListCell *lambdaParamName;
+			Node * arg = (Node *) lfirst(l);
+
+			if (IsA(arg, LambdaExpr)) {
+				int argPos = 0;
+				ListCell* subtableInfo = list_head(ltiList);
+				List* argCheckList = NIL;
+				LambdaExpr *lambda = castNode(LambdaExpr, arg);
+				LambdaExpr *parentLambda = pstate->p_current_lambda;
+				List *parentLambdaTableInfos = pstate->p_current_ltis;
+
+				lambda->argtypes = NIL;
+				pstate->p_current_ltis = ltiList;
+				pstate->p_current_lambda = lambda;
+
+				foreach(lambdaParamName, lambda->args)
+				{
+					argCheckList = list_append_unique(argCheckList,
+						lfirst(lambdaParamName));
+
+					if (list_length(argCheckList) != argPos + 1)
+					{
+						ereport(ERROR,
+						(errcode(ERRCODE_DUPLICATE_ALIAS),
+						 errmsg("duplicate lambda arg name \"%s\"",
+						 	strVal(lfirst(lambdaParamName))),
+						 parser_errposition(pstate,
+											exprLocation((Node *) lambda))));
+					}
+
+					if (argPos < list_length(ltiList) - 1)
+						subtableInfo = lnext(subtableInfo);
+
+					lambda->argtypes = lappend(lambda->argtypes,
+						lfirst(subtableInfo));
+					argPos++;
+				}
+
+				lambda->expr = (Expr *) transformExpr(pstate, (Node *) lambda->expr,
+					EXPR_KIND_LAMBDA_EXPRESSION);
+				lambda->rettype = exprType((Node *) lambda->expr);
+				lambda->rettypmod = exprTypmod((Node *) lambda->expr);
+				
+				pstate->p_current_lambda = parentLambda;
+				pstate->p_current_ltis = parentLambdaTableInfos;
+			}
+		}
+	}		
+
+	pstate->p_pre_columnref_hook = oldColumnRefHook;
 
 	/* build the appropriate output structure */
 	if (fdresult == FUNCDETAIL_NORMAL || fdresult == FUNCDETAIL_PROCEDURE)
@@ -2369,6 +2539,9 @@ check_srf_call_placement(ParseState *pstate, Node *last_srf, int location)
 			break;
 		case EXPR_KIND_CALL_ARGUMENT:
 			err = _("set-returning functions are not allowed in CALL arguments");
+			break;
+		case EXPR_KIND_LAMBDA_EXPRESSION:
+			err = _("set-returning functions are not allowed in LAMBDA expressions");
 			break;
 
 			/*

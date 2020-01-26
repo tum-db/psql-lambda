@@ -146,6 +146,92 @@ ExecInitExpr(Expr *node, PlanState *parent)
 	return state;
 }
 
+
+/*
+ * ExecInitLambdaExpr: prepare a lambda expression tree for execution
+ * If fastLambda is set to true, the accelerated but less-featured 
+ * JIT compilation is used.
+ */
+ExprState *
+ExecInitLambdaExpr(Node *node, bool fastLambda)
+{
+	int oldflags;
+	ParamListInfo paramList;
+	ExprState  *state;
+	LambdaExpr	   *expr = (LambdaExpr *) node;
+
+	ExprEvalStep scratch = {0};
+
+	if (!fastLambda)
+	{
+		paramList = (ParamListInfo) palloc0(offsetof(ParamListInfoData, params) +
+			list_length(expr->args) * sizeof(ParamExternData));
+		paramList->numParams = list_length(expr->args);
+
+	    for (int i = 0; i < paramList->numParams; i++)
+	    {			    
+	        ParamExternData* paramData = &paramList->params[i];
+
+	        paramData->value = (Datum) 0;
+	        paramData->isnull = false;
+	        paramData->pflags = 0;
+	        paramData->ptype = RECORDOID;
+	    }
+	}
+
+
+	/* Special case: NULL expression produces a NULL ExprState pointer */
+	if (node == NULL)
+		return NULL;
+
+	/* Initialize ExprState with empty step list */
+	state = makeNode(ExprState);
+	state->expr = expr->expr;
+	state->parent = (PlanState *) expr->parentPlan;
+	state->ext_params = NULL;
+	state->load_consts_explicitly = true;
+
+	/* Insert EEOP_*_FETCHSOME steps as needed */
+	ExecInitExprSlots(state, (Node *) expr->expr);
+
+	/* Compile the expression proper */
+	ExecInitExprRec(expr->expr, state, &state->resvalue, &state->resnull);
+
+	/* Finally, append a DONE step */
+	scratch.opcode = EEOP_DONE;
+	ExprEvalPushStep(state, &scratch);
+
+	oldflags = state->parent->state->es_jit_flags;
+	
+	state->fast_jit = fastLambda;
+	state->parent->state->es_jit_flags |= PGJIT_INLINE;
+	state->parent->state->es_jit_flags |= PGJIT_OPT3;
+	
+	if (!jit_force_compile_expr(state))
+	{
+		ereport(WARNING,
+				(errmsg("lambda expression could not be JIT-compiled; please make sure " \
+				 	"LLVM is enabled.")));
+
+		ExecReadyExpr(state);
+	}
+
+	state->parent->state->es_jit_flags = oldflags;
+
+	expr->exprstate = (Node *) state;
+
+	if (!fastLambda)
+	{
+		castNode(ExprState, expr->exprstate)->ext_params = paramList;
+
+		expr->econtext = (Node *) CreateExprContext(state->parent->state);
+		castNode(ExprContext, expr->econtext)->ecxt_param_list_info = paramList;
+	}
+	
+
+	return state;
+}
+
 /*
  * ExecInitExprWithParams: prepare a standalone expression tree for execution
  *
@@ -652,6 +738,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 	scratch.resvalue = resv;
 	scratch.resnull = resnull;
 
+
 	/* cases should be ordered as they are in enum NodeTag */
 	switch (nodeTag(node))
 	{
@@ -723,6 +810,25 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				break;
 			}
 
+		case T_LambdaExpr:
+			{
+				LambdaExpr	   *expr = (LambdaExpr *) node;
+
+				/*
+				 * We treat the lambda expression as a constant for now. The tablefunc will decide
+				 * what to do with it (interpreted execution, JIT etc.)
+				 */
+				scratch.opcode = EEOP_CONST;
+				scratch.d.constval.value = PointerGetDatum(node);
+				scratch.d.constval.isnull = false;
+
+				expr->parentPlan = (Node *) state->parent;
+
+				ExprEvalPushStep(state, &scratch);
+
+				break;
+			}
+
 		case T_Param:
 			{
 				Param	   *param = (Param *) node;
@@ -761,6 +867,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 							scratch.opcode = EEOP_PARAM_EXTERN;
 							scratch.d.param.paramid = param->paramid;
 							scratch.d.param.paramtype = param->paramtype;
+							scratch.d.param.lambda = param->lambda;
 							ExprEvalPushStep(state, &scratch);
 						}
 						break;
@@ -1129,8 +1236,9 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				scratch.opcode = EEOP_FIELDSELECT;
 				scratch.d.fieldselect.fieldnum = fselect->fieldnum;
 				scratch.d.fieldselect.resulttype = fselect->resulttype;
-				scratch.d.fieldselect.argdesc = NULL;
-
+				scratch.d.fieldselect.argdesc = fselect->lambda;
+				scratch.d.fieldselect.lambda = fselect->lambda != NULL;
+				
 				ExprEvalPushStep(state, &scratch);
 				break;
 			}
@@ -2115,7 +2223,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 			}
 
 		default:
-			elog(ERROR, "unrecognized node type: %d",
+				elog(ERROR, "unrecognized node type: %d",
 				 (int) nodeTag(node));
 			break;
 	}
@@ -2217,7 +2325,7 @@ ExecInitFunc(ExprEvalStep *scratch, Expr *node, List *args, Oid funcid,
 	{
 		Expr	   *arg = (Expr *) lfirst(lc);
 
-		if (IsA(arg, Const))
+		if (IsA(arg, Const) && !state->load_consts_explicitly)
 		{
 			/*
 			 * Don't evaluate const arguments every round; especially
@@ -2227,6 +2335,13 @@ ExecInitFunc(ExprEvalStep *scratch, Expr *node, List *args, Oid funcid,
 
 			fcinfo->arg[argno] = con->constvalue;
 			fcinfo->argnull[argno] = con->constisnull;
+		}
+		else if(IsA(arg, LambdaExpr))
+		{
+			LambdaExpr *le = (LambdaExpr *) arg;
+
+			fcinfo->arg[argno] = PointerGetDatum(le);
+			fcinfo->argnull[argno] = false;
 		}
 		else
 		{

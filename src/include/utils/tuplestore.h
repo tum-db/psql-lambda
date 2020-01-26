@@ -39,6 +39,14 @@
  */
 typedef struct Tuplestorestate Tuplestorestate;
 
+
+/* A tuplestore with a TupleDesc attached */
+typedef struct TypedTuplestore
+{
+	TupleDesc tupledesc;
+	Tuplestorestate* tuplestorestate;
+} TypedTuplestore;
+
 /*
  * Currently we only need to store MinimalTuples, but it would be easy
  * to support the same behavior for IndexTuples and/or bare Datums.

@@ -212,6 +212,12 @@ FreeExecutorState(EState *estate)
 		estate->es_jit = NULL;
 	}
 
+	if (estate->es_jit_tmp)
+	{
+		jit_release_context(estate->es_jit_tmp);
+		estate->es_jit_tmp = NULL;
+	}
+
 	/*
 	 * Free the per-query memory context, thereby releasing all working
 	 * memory, including the EState node itself.
@@ -285,6 +291,7 @@ CreateExprContext(EState *estate)
 
 	return econtext;
 }
+
 
 /* ----------------
  *		CreateStandaloneExprContext

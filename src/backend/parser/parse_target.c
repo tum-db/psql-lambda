@@ -1809,6 +1809,8 @@ FigureColnameInternal(Node *node, char **name)
 					/* As with other operator-like nodes, these have no names */
 				case MULTIEXPR_SUBLINK:
 				case ALL_SUBLINK:
+				case FUNC_SUBLINK:
+				case CURSOR_SUBLINK:
 				case ANY_SUBLINK:
 				case ROWCOMPARE_SUBLINK:
 				case CTE_SUBLINK:

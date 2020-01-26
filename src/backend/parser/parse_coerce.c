@@ -222,6 +222,45 @@ coerce_type(ParseState *pstate, Node *node,
 			return node;
 		}
 	}
+
+	if (targetTypeId == LAMBDATABLEOID)
+	{
+		/* Ensure that sublink is of FUNC_SUBLINK type */
+		if (IsA(node, SubLink))
+		{
+			SubLink *sublink = (SubLink *) node;
+			sublink->subLinkType = FUNC_SUBLINK;
+
+			return node;
+		}
+		else 
+		{
+			ereport(ERROR,
+				(errcode(ERRCODE_CANNOT_COERCE),
+				 errmsg("only subqueries can be used as LAMBDATABLE arguments for a function"),
+				 parser_coercion_errposition(pstate, location, node)));
+		}
+	}
+
+	if (targetTypeId == LAMBDACURSOROID)
+	{
+		/* Ensure that sublink is of CURSOR_SUBLINK type */
+		if (IsA(node, SubLink))
+		{
+			SubLink *sublink = (SubLink *) node;
+			sublink->subLinkType = CURSOR_SUBLINK;
+
+			return node;
+		}
+		else 
+		{
+			ereport(ERROR,
+				(errcode(ERRCODE_CANNOT_COERCE),
+				 errmsg("only subqueries can be used as LAMBDACURSOR arguments for a function"),
+				 parser_coercion_errposition(pstate, location, node)));
+		}
+	}
+
 	if (inputTypeId == UNKNOWNOID && IsA(node, Const))
 	{
 		/*
@@ -616,6 +655,13 @@ can_coerce_type(int nargs, Oid *input_typeids, Oid *target_typeids,
 		 */
 		if (targetTypeId == RECORDARRAYOID &&
 			is_complex_array(inputTypeId))
+			continue;
+
+
+		/*
+		 * Accept lambda tables and lambda cursors
+		 */
+		if (targetTypeId == LAMBDATABLEOID || targetTypeId == LAMBDACURSOROID)
 			continue;
 
 		/*

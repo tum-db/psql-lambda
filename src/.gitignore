@@ -1,3 +1,7 @@
 /Makefile.global
 /Makefile.port
 /Makefile.custom
+*.bc
+*.o
+*.a
+*.so

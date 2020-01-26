@@ -404,6 +404,8 @@ fmgr_info_C_lang(Oid functionId, FmgrInfo *finfo, HeapTuple procedureTuple)
 		/* Get the function information record (real or default) */
 		inforec = fetch_finfo_record(libraryhandle, prosrcstring);
 
+		finfo->fn_rectype = inforec->rectype_func;
+
 		/* Cache the addresses for later calls */
 		record_C_func(procedureTuple, user_fn, inforec);
 

@@ -15,6 +15,7 @@
 
 #include "access/htup_details.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_language_d.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
@@ -387,6 +388,46 @@ internal_get_result_type(Oid funcid,
 				if (resultTupleDesc)
 					*resultTupleDesc = rsinfo->expectedDesc;
 				/* Assume no polymorphic columns here, either */
+			}
+			
+			/* If it is a C language function, there might be
+			   an associated callback function which returns
+			   the record type based on the arguments */
+			else if (procform->prolang == ClanguageId && resultTupleDesc)
+			{
+				const Pg_finfo_record *inforec;
+				void	   *libraryhandle;
+				bool isnull;
+				char       *prosrcstring;
+				char       *probinstring;
+
+				probinstring = TextDatumGetCString(
+					SysCacheGetAttr(PROCOID, tp,
+									 Anum_pg_proc_probin, &isnull));
+
+				if (!isnull)
+				{
+					prosrcstring = TextDatumGetCString(
+					SysCacheGetAttr(PROCOID, tp,
+									 Anum_pg_proc_prosrc, &isnull));
+					(void) load_external_function(probinstring, prosrcstring,
+						true, &libraryhandle);
+
+					inforec = fetch_finfo_record(libraryhandle,
+						prosrcstring);
+
+					if (inforec->rectype_func != NULL)
+					{
+						*resultTupleDesc = inforec->rectype_func(
+							castNode(FuncExpr, call_expr)->args);
+
+						if (*resultTupleDesc != NULL)
+						{
+							result = TYPEFUNC_COMPOSITE;
+						}
+					}
+				}
+				
 			}
 			break;
 		default:

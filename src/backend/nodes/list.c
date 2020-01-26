@@ -458,6 +458,32 @@ list_member(const List *list, const void *datum)
 }
 
 /*
+ * Returns the index of 'datum' in the list. Equality is
+ * determined via equal(), so callers should ensure that they pass a
+ * Node as 'datum'.
+ */
+int
+list_index(const List *list, const void *datum)
+{
+	int idx = 0;
+
+	const ListCell *cell;
+
+	Assert(IsPointerList(list));
+	check_list_invariants(list);
+
+	foreach(cell, list)
+	{
+		if (equal(lfirst(cell), datum))
+			return idx;
+
+		idx++;
+	}
+
+	return -1;
+}
+
+/*
  * Return true iff 'datum' is a member of the list. Equality is
  * determined by using simple pointer comparison.
  */

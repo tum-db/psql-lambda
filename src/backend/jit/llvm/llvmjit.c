@@ -22,6 +22,7 @@
 #include "utils/resowner_private.h"
 #include "portability/instr_time.h"
 #include "storage/ipc.h"
+#include "nodes/value.h"
 
 
 #include <llvm-c/Analysis.h>
@@ -49,6 +50,7 @@ typedef struct LLVMJitHandle
 
 
 /* types & functions commonly needed for JITing */
+LLVMTypeRef TypeDatum;
 LLVMTypeRef TypeSizeT;
 LLVMTypeRef TypeParamBool;
 LLVMTypeRef TypeStorageBool;
@@ -105,6 +107,7 @@ static LLVMOrcJITStackRef llvm_opt3_orc;
 static void llvm_release_context(JitContext *context);
 static void llvm_session_initialize(void);
 static void llvm_shutdown(int code, Datum arg);
+
 static void llvm_compile_module(LLVMJitContext *context);
 static void llvm_optimize_module(LLVMJitContext *context, LLVMModuleRef module);
 
@@ -124,6 +127,7 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 	cb->reset_after_error = llvm_reset_after_error;
 	cb->release_context = llvm_release_context;
 	cb->compile_expr = llvm_compile_expr;
+	cb->compile_simple_expr = llvm_compile_simple_expr;
 }
 
 /*
@@ -147,6 +151,9 @@ llvm_create_context(int jitFlags)
 	context = MemoryContextAllocZero(TopMemoryContext,
 									 sizeof(LLVMJitContext));
 	context->base.flags = jitFlags;
+
+	context->funcnames = NIL;
+	context->simpleFuncnames = NIL;
 
 	/* ensure cleanup */
 	context->base.resowner = CurrentResourceOwner;
@@ -178,10 +185,15 @@ llvm_release_context(JitContext *context)
 			llvm_context->module = NULL;
 		}
 
+		if(llvm_context->moduleCopy)
+		{
+			LLVMDisposeModule(llvm_context->moduleCopy);
+			llvm_context->moduleCopy = NULL;
+		}
+
 		while (llvm_context->handles != NIL)
 		{
 			LLVMJitHandle *jit_handle;
-
 			jit_handle = (LLVMJitHandle *) linitial(llvm_context->handles);
 			llvm_context->handles = list_delete_first(llvm_context->handles);
 
@@ -189,6 +201,36 @@ llvm_release_context(JitContext *context)
 			pfree(jit_handle);
 		}
 	}
+}
+
+
+
+/*
+ * Switches to a temporary JIT context used for short-lived (e.g. lambda) expressions.
+ */
+void
+llvm_enter_tmp_context(EState *state)
+{
+	JitContext *oldcontext = state->es_jit;
+
+	if (!state->es_jit_tmp)
+	{
+		state->es_jit_tmp = &(llvm_create_context(PGJIT_OPT3 | PGJIT_INLINE)->base);
+	}
+	
+	state->es_jit = state->es_jit_tmp;
+	state->es_jit_tmp = oldcontext;
+}
+
+/*
+ * Switches back from the temporary JIT context to the main JIT context.
+ */
+void
+llvm_leave_tmp_context(EState *state)
+{	
+	JitContext *oldcontext = state->es_jit_tmp;
+	state->es_jit_tmp = state->es_jit;
+	state->es_jit = oldcontext;
 }
 
 /*
@@ -220,8 +262,9 @@ llvm_mutable_module(LLVMJitContext *context)
  * a Module.
  */
 char *
-llvm_expand_funcname(struct LLVMJitContext *context, const char *basename)
+llvm_expand_funcname(struct LLVMJitContext *context, const char *basename, bool simple)
 {
+	char* funcname;
 	Assert(context->module != NULL);
 
 	context->base.instr.created_functions++;
@@ -230,10 +273,23 @@ llvm_expand_funcname(struct LLVMJitContext *context, const char *basename)
 	 * Previously we used dots to separate, but turns out some tools, e.g.
 	 * GDB, don't like that and truncate name.
 	 */
-	return psprintf("%s_%zu_%d",
+	funcname = psprintf("%s_%zu_%d",
 					basename,
 					context->module_generation,
 					context->counter++);
+
+
+	if (simple)
+	{
+		context->simpleFuncnames = lappend(context->simpleFuncnames, makeString(funcname));
+	}
+	else
+	{
+		context->funcnames = lappend(context->funcnames, makeString(funcname));
+	}
+	
+
+	return funcname;
 }
 
 /*
@@ -410,6 +466,7 @@ llvm_function_reference(LLVMJitContext *context,
 	return v_fn;
 }
 
+
 /*
  * Optimize code in module using the flags set in context.
  */
@@ -439,7 +496,7 @@ llvm_optimize_module(LLVMJitContext *context, LLVMModuleRef module)
 	if (context->base.flags & PGJIT_OPT3)
 	{
 		/* TODO: Unscientifically determined threshhold */
-		LLVMPassManagerBuilderUseInlinerWithThreshold(llvm_pmb, 512);
+		LLVMPassManagerBuilderUseInlinerWithThreshold(llvm_pmb, 16384);
 	}
 	else
 	{
@@ -515,10 +572,10 @@ llvm_compile_module(LLVMJitContext *context)
 		filename = psprintf("%u.%zu.bc",
 							MyProcPid,
 							context->module_generation);
+
 		LLVMWriteBitcodeToFile(context->module, filename);
 		pfree(filename);
 	}
-
 
 	/* optimize according to the chosen optimization settings */
 	INSTR_TIME_SET_CURRENT(starttime);
@@ -545,6 +602,7 @@ llvm_compile_module(LLVMJitContext *context)
 	 * faster instruction selection mechanism is used.
 	 */
 	INSTR_TIME_SET_CURRENT(starttime);
+
 #if LLVM_VERSION_MAJOR > 6
 	{
 		if (LLVMOrcAddEagerlyCompiledIR(compile_orc, &orc_handle, context->module,
@@ -552,6 +610,7 @@ llvm_compile_module(LLVMJitContext *context)
 		{
 			elog(ERROR, "failed to JIT module");
 		}
+
 
 		/* LLVMOrcAddEagerlyCompiledIR takes ownership of the module */
 	}
@@ -801,6 +860,7 @@ llvm_create_types(void)
 	llvm_triple = pstrdup(LLVMGetTarget(mod));
 	llvm_layout = pstrdup(LLVMGetDataLayoutStr(mod));
 
+	TypeDatum = load_type(mod, "TypeDatum");
 	TypeSizeT = load_type(mod, "TypeSizeT");
 	TypeParamBool = load_return_type(mod, "FunctionReturningBool");
 	TypeStorageBool = load_type(mod, "TypeStorageBool");

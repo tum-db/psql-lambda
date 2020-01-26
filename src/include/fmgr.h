@@ -18,6 +18,8 @@
 #ifndef FMGR_H
 #define FMGR_H
 
+#include <access/tupdesc.h>
+
 /* We don't want to include primnodes.h here, so make some stub references */
 typedef struct Node *fmNodePtr;
 typedef struct Aggref *fmAggrefPtr;
@@ -38,6 +40,7 @@ typedef struct StringInfoData *fmStringInfo;
 typedef struct FunctionCallInfoData *FunctionCallInfo;
 
 typedef Datum (*PGFunction) (FunctionCallInfo fcinfo);
+typedef TupleDesc (*fmRecordTypeFunction) (List *args);
 
 /*
  * This struct holds the system-catalog information that must be looked up
@@ -64,6 +67,8 @@ typedef struct FmgrInfo
 	void	   *fn_extra;		/* extra space for use by handler */
 	MemoryContext fn_mcxt;		/* memory context to store fn_extra in */
 	fmNodePtr	fn_expr;		/* expression parse tree for call, or NULL */
+	fmRecordTypeFunction fn_rectype; /* callback function returning record type
+	                                    of result, or NULL */
 } FmgrInfo;
 
 /*
@@ -246,6 +251,19 @@ extern struct varlena *pg_detoast_datum_packed(struct varlena *datum);
 #define PG_GETARG_POINTER(n) DatumGetPointer(PG_GETARG_DATUM(n))
 #define PG_GETARG_CSTRING(n) DatumGetCString(PG_GETARG_DATUM(n))
 #define PG_GETARG_NAME(n)	 DatumGetName(PG_GETARG_DATUM(n))
+#define PG_GETARG_LAMBDA(n)	 (LambdaExpr *) (PG_GETARG_POINTER(n))
+#define PG_LAMBDA_SETARG(l, i, a) \
+	((ParamExternData*) ((ParamListInfo) castNode(ExprContext, l->econtext) \
+    ->ecxt_param_list_info)->params)[i].value = a
+/*#define PG_LAMBDA_EVAL(l, isnull) castNode(ExprState, l->exprstate)->evalfunc( \
+    castNode(ExprState, l->exprstate), castNode(ExprContext, l->econtext), isnull) */
+#define PG_LAMBDA_EVAL(l, i, isnull) castNode(ExprState, l->exprstate)->evalfunc( \
+    castNode(ExprState, l->exprstate), castNode(ExprContext, l->econtext), isnull) 
+#define PG_LAMBDA_EVAL_CUSTOM(l, s, c, isnull) castNode(ExprState, s)->evalfunc( \
+    castNode(ExprState, s), castNode(ExprContext, c), isnull) 
+#define PG_LAMBDA_INJECT(l, idx, isnull) ExecEvalLambdaExpr(castNode(ExprState, l->exprstate), \
+	castNode(ExprContext, l->econtext), isnull, idx)
+#define PG_SIMPLE_LAMBDA_INJECT(d, idx) ExecEvalSimpleLambdaExpr(d, idx)
 /* these macros hide the pass-by-reference-ness of the datatype: */
 #define PG_GETARG_FLOAT4(n)  DatumGetFloat4(PG_GETARG_DATUM(n))
 #define PG_GETARG_FLOAT8(n)  DatumGetFloat8(PG_GETARG_DATUM(n))
@@ -357,7 +375,9 @@ extern struct varlena *pg_detoast_datum_packed(struct varlena *datum);
 
 typedef struct
 {
-	int			api_version;	/* specifies call convention version number */
+	int					 api_version;	/* specifies call convention version number */
+	fmRecordTypeFunction rectype_func;	/* callback for retrieving the RECORD type */
+
 	/* More fields may be added later, for version numbers > 1. */
 } Pg_finfo_record;
 
@@ -382,7 +402,19 @@ extern PGDLLEXPORT const Pg_finfo_record * CppConcat(pg_finfo_,funcname)(void); 
 const Pg_finfo_record * \
 CppConcat(pg_finfo_,funcname) (void) \
 { \
-	static const Pg_finfo_record my_finfo = { 1 }; \
+	static const Pg_finfo_record my_finfo = { 1, NULL }; \
+	return &my_finfo; \
+} \
+extern int no_such_variable
+
+
+#define PG_FUNCTION_INFO_V1_RECTYPE(funcname, rectypeFunc) \
+extern Datum funcname(PG_FUNCTION_ARGS); \
+extern PGDLLEXPORT const Pg_finfo_record * CppConcat(pg_finfo_,funcname)(void); \
+const Pg_finfo_record * \
+CppConcat(pg_finfo_,funcname) (void) \
+{ \
+	static const Pg_finfo_record my_finfo = { 1, rectypeFunc }; \
 	return &my_finfo; \
 } \
 extern int no_such_variable

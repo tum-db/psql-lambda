@@ -528,7 +528,9 @@ build_subplan(PlannerInfo *root, Plan *plan, PlannerInfo *subroot,
 		 * unnecessarily, so we don't.
 		 */
 		else if (splan->parParam == NIL && enable_material &&
-				 !ExecMaterializesOutput(nodeTag(plan)))
+				 !ExecMaterializesOutput(nodeTag(plan))
+				 && subLinkType != CURSOR_SUBLINK
+				 && subLinkType != FUNC_SUBLINK)
 			plan = materialize_finished_plan(plan);
 
 		result = (Node *) splan;

@@ -35,7 +35,7 @@
 bool		jit_enabled = false;
 char	   *jit_provider = NULL;
 bool		jit_debugging_support = false;
-bool		jit_dump_bitcode = false;
+bool		jit_dump_bitcode = true;
 bool		jit_expressions = true;
 bool		jit_profiling_support = false;
 bool		jit_tuple_deforming = true;
@@ -164,6 +164,7 @@ jit_compile_expr(struct ExprState *state)
 	 * usage, and worse, trigger some quadratic behaviour in gdb. Therefore,
 	 * at least for now, don't create a JITed function in those circumstances.
 	 */
+
 	if (!state->parent)
 		return false;
 
@@ -178,6 +179,32 @@ jit_compile_expr(struct ExprState *state)
 	/* this also takes !jit_enabled into account */
 	if (provider_init())
 		return provider.compile_expr(state);
+
+	return false;
+}
+
+/*
+ * Enforces JIT compilation for an expression.
+ *
+ * This is used for compiling lambda expressions which otherwise
+ * might not be compiled.
+ */
+bool
+jit_force_compile_expr(struct ExprState *state)
+{
+	/* this also takes !jit_enabled into account */
+	if (provider_init()) 
+	{
+		if (state->fast_jit)
+		{
+			return provider.compile_simple_expr(state);
+		}
+		else
+		{
+			return provider.compile_expr(state);
+		}
+		
+	}
 
 	return false;
 }

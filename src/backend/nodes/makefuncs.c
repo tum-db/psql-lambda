@@ -442,6 +442,7 @@ makeRangeVar(char *schemaname, char *relname, int location)
 TypeName *
 makeTypeName(char *typnam)
 {
+	printf("Type: %s\n", typnam);
 	return makeTypeNameFromNameList(list_make1(makeString(typnam)));
 }
 
@@ -454,6 +455,7 @@ makeTypeName(char *typnam)
 TypeName *
 makeTypeNameFromNameList(List *names)
 {
+
 	TypeName   *n = makeNode(TypeName);
 
 	n->names = names;

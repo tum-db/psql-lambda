@@ -252,6 +252,7 @@ ExecProcNode(PlanState *node)
  * prototypes from functions in execExpr.c
  */
 extern ExprState *ExecInitExpr(Expr *node, PlanState *parent);
+extern ExprState *ExecInitLambdaExpr(Node *node, bool fastLambda);
 extern ExprState *ExecInitExprWithParams(Expr *node, ParamListInfo ext_params);
 extern ExprState *ExecInitQual(List *qual, PlanState *parent);
 extern ExprState *ExecInitCheck(List *qual, PlanState *parent);

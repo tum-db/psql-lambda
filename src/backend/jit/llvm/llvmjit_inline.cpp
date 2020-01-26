@@ -21,11 +21,11 @@
 
 extern "C"
 {
+	#define INLINE_DEBUG 1
 #include "postgres.h"
 }
 
 #include "jit/llvmjit.h"
-
 extern "C"
 {
 #include <fcntl.h>
@@ -37,17 +37,23 @@ extern "C"
 #include "common/string.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "nodes/value.h"
 }
 
 #include <llvm-c/Core.h>
+#include <llvm/Support/raw_ostream.h>
 #include <llvm-c/BitReader.h>
+#include <llvm-c/BitWriter.h>
 
 #include <llvm/ADT/SetVector.h>
 #include <llvm/ADT/StringSet.h>
 #include <llvm/ADT/StringMap.h>
 #include <llvm/Analysis/ModuleSummaryAnalysis.h>
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #if LLVM_VERSION_MAJOR > 3
+
 #include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/Bitcode/BitcodeWriter.h>
 #else
 #include <llvm/Bitcode/ReaderWriter.h>
 #include <llvm/Support/Error.h>
@@ -58,9 +64,11 @@ extern "C"
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/ModuleSummaryIndex.h>
+#include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Linker/IRMover.h>
+#include <llvm/Linker/Linker.h>
 #include <llvm/Support/ManagedStatic.h>
-
+#include <llvm/Transforms/Utils/Cloning.h>
 
 /*
  * Type used to represent modules InlineWorkListItem's subject is searched for
@@ -99,7 +107,7 @@ typedef llvm::StringMap<llvm::StringSet<> > ImportMapTy;
 
 
 const float inline_cost_decay_factor = 0.5;
-const int inline_initial_cost = 150;
+const int inline_initial_cost = 0;
 
 /*
  * These are managed statics so LLVM knows to deallocate them during an
@@ -137,6 +145,19 @@ static void function_references(llvm::Function &F,
 								llvm::SmallPtrSet<llvm::GlobalVariable *, 8> &referencedVars,
 								llvm::SmallPtrSet<llvm::Function *, 8> &referencedFunctions);
 
+class LambdaInjectionPass : public llvm::FunctionPass {
+    public:
+        static char id;
+        LambdaInjectionPass(LLVMJitContext* context, int numLambdas) : llvm::FunctionPass(id),
+        m_context(context), m_numLambdas(numLambdas) {}
+        virtual bool runOnFunction(llvm::Function &F) override;
+
+    private:
+    	LLVMJitContext* m_context;
+    	int m_numLambdas;
+};
+
+
 static void add_module_to_inline_search_path(InlineSearchPath& path, llvm::StringRef modpath);
 static llvm::SmallVector<llvm::GlobalValueSummary *, 1>
 summaries_for_guid(const InlineSearchPath& path, llvm::GlobalValue::GUID guid);
@@ -148,6 +169,104 @@ summaries_for_guid(const InlineSearchPath& path, llvm::GlobalValue::GUID guid);
 #else
 #define ilog(...)	(void) 0
 #endif
+
+
+char LambdaInjectionPass::id = 0;
+
+/*
+ * This LLVM pass will directly inject lambda expression evaluation calls into
+ * a tablefunction by searching for calls to ExecEvalLambdaExpr or
+ * ExecEvalSimpleLambdaExpr and afterwards replacing
+ * them by calls to the JIT-compiled lambda expression. In addition, they get
+ * flagged as AlwaysInline, so they will eventually be inlined by the optimizer.
+ */
+bool LambdaInjectionPass::runOnFunction(llvm::Function &F) {
+	llvm::Function* fn;
+	llvm::LLVMContext &Context = F.getContext();
+	llvm::IRBuilder<> Builder(Context);
+	llvm::SmallVector<std::pair<llvm::Instruction*, llvm::Instruction*>, 8> replacements;
+
+	bool changed = false;
+
+    for (llvm::BasicBlock &BB : F) {
+        for (llvm::Instruction &II : BB) {
+            llvm::Instruction *I = &II;
+            llvm::CallInst *op;
+
+            if ((op = llvm::dyn_cast<llvm::CallInst>(I))
+            	&& (fn = op->getCalledFunction())) {
+            	if (fn->getName() == "ExecEvalLambdaExpr")
+            	{
+            		char *funcname;
+
+	        		int idx = -1;
+
+	        		if (auto argIdx = llvm::dyn_cast<llvm::ConstantInt>(op->getArgOperand(3)))
+	        		{
+	        			idx = argIdx->getSExtValue();
+	        		}
+
+	        		if (idx < 0 || idx >= list_length(m_context->funcnames))
+	        		{
+	        			ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("Invalid lambda expression index passed to" \
+						 "PG_LAMBDA_INJECT. Plese give an immediate between 0 and %i.",
+						 list_length(m_context->funcnames) - 1)));
+	        		}
+
+	        		funcname = strVal(list_nth(m_context->funcnames, idx));
+	        		F.getParent()->getFunction(funcname)->addAttribute(~0U, llvm::Attribute::AlwaysInline);
+	        		op->setCalledFunction(F.getParent()->getFunction(funcname));
+	        		changed = true;
+            	}
+            	else if (fn->getName() == "ExecEvalSimpleLambdaExpr")
+            	{
+            		char *funcname = NULL;
+					llvm::CallInst *newCall;
+
+	        		int idx = -1;
+
+	        		if (auto argIdx = llvm::dyn_cast<llvm::ConstantInt>(op->getArgOperand(1)))
+	        		{
+	        			idx = argIdx->getSExtValue();
+	        		}
+
+	        		if (idx < 0 || idx >= list_length(m_context->simpleFuncnames))
+	        		{
+	        			ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("Invalid lambda expression index passed to" \
+						 "PG_SIMPLE_LAMBDA_INJECT. Plese give an immediate between 0 and %i.",
+						 list_length(m_context->simpleFuncnames) - 1)));
+	        		}
+
+	        		funcname = strVal(list_nth(m_context->simpleFuncnames, idx));
+	        		F.getParent()->getFunction(funcname)->addAttribute(~0U, llvm::Attribute::AlwaysInline);
+
+	        		newCall = llvm::CallInst::Create(F.getParent()->getFunction(funcname),
+	        			{ op->getArgOperand(0) });
+	        		replacements.push_back(std::make_pair(llvm::dyn_cast<llvm::Instruction>(op),
+	        			llvm::dyn_cast<llvm::Instruction>(newCall)));
+	        		changed = true;
+            	}
+            	
+
+        	}
+
+        }
+    }
+
+    for (auto& el : replacements)
+    {
+    	llvm::ReplaceInstWithInst(el.first, el.second);
+    }
+
+	m_context->funcnames = NIL;
+	m_context->simpleFuncnames = NIL;
+
+    return changed;
+}
 
 /*
  * Perform inlining of external function references in M based on a simple
@@ -161,8 +280,119 @@ llvm_inline(LLVMModuleRef M)
 	std::unique_ptr<ImportMapTy> globalsToInline = llvm_build_inline_plan(mod);
 	if (!globalsToInline)
 		return;
+
 	llvm_execute_inline_plan(mod, globalsToInline.get());
 }
+
+
+
+/*
+ * Loads the bitcode of a C extension named bcModule, locates the function named
+ * funcName in it and injects numLambdas lambda expressions into it. The lambda
+ * expressions must be contained in the passed LLVMJitContext after having been
+ * initialized via a call to ExecInitLambdaExpr.
+ * 
+ * In the C extension, the PG_LAMBDA_INJECT or PG_SIMPLE_LAMBDA_INJECT macros must
+ * be used as placeholders for the lambda return values as follows: 
+ *
+ * [1] PG_LAMBDA_INJECT(LambdaExpr *, int, bool *)
+ * [2] PG_SIMPLE_LAMBDA_INJECT(Datum **, int)
+ *
+ * For fully-featured lambda expressions [1], the LambdaExpr must be passed to 
+ * the macro and a bool value indicating whether the lambda result is NULL
+ * will be written to the specified bool pointer. The lambda parameters must
+ * have been set with the PG_LAMBDA_SETARG macro beforehand.
+ *
+ * For fast ("simple") lambda expressions [2], a Datum** pointer holding the
+ * parameters must be passed to the macro. The first indirection selects 
+ * a row and the second indirection selects a Datum value from the row.
+ *
+ * For both [1] and [2], the int parameter specifies the index of the lambda
+ * expression in the order all the lambda expressions have been initialized with
+ * ExecInitLambdaExpr, i.e. the int value must be in [0, n) with n being the total
+ * number of lambda expressions used in the function.  
+ *
+ * The function returns a pointer to the ready-to-be-executed function having the
+ * same signature as the C function it originates from.
+ */
+Datum (*llvm_prepare_lambda_tablefunc(LLVMJitContext *context,
+	char* bcModule, char* funcName, int numLambdas))(PG_FUNCTION_ARGS)
+{
+	llvm::SmallVector<llvm::Function*, 8> funcsToDelete;
+	llvm::Module* mod;
+	llvm::Function* func;
+	Datum (*funcPtr)(FunctionCallInfo);
+	auto tfMod = load_module(bcModule);	
+
+
+	/* Keep a copy of the mutable module in case multiple compilations are needed */
+	if (!context->compiled)
+	{
+		if (list_length(context->funcnames) > numLambdas)
+		{
+			context->moduleCopy = LLVMCloneModule(context->module);
+		}
+
+		mod = llvm::unwrap(context->module);
+	}
+	else
+	{
+		context->compiled = false;
+		context->module = LLVMCloneModule(context->moduleCopy);
+		mod = llvm::unwrap(context->module);
+	}	
+
+	/*
+	 * Erase all functions from the extension which should not be compiled
+	 * to reduce compile time.
+	 */
+	for (llvm::Function &functmp : tfMod->functions())
+	{
+		if (!functmp.isDeclaration() && functmp.getName() != funcName)
+		{	
+			functmp.replaceAllUsesWith(llvm::UndefValue::get(functmp.getType()));
+			funcsToDelete.push_back(&functmp);	
+		}
+	}	
+
+	for (auto el : funcsToDelete)
+    {	
+    	el->eraseFromParent();
+    }
+	
+	llvm::legacy::FunctionPassManager FPM(tfMod.get());
+	llvm::Linker::linkModules(*mod, std::move(tfMod), llvm::Linker::Flags::None);
+
+	func = mod->getFunction(funcName);
+
+	/* Run the pass that performs the actual inlining */
+	FPM.add(new LambdaInjectionPass(context, numLambdas));
+	FPM.run(*func);
+	
+	/* The call to llvm_get_function will compile and optimize the function */
+	funcPtr = (Datum (*)(FunctionCallInfo)) llvm_get_function(context, funcName);
+
+	return funcPtr;
+}
+
+
+
+/*
+ * JIT-compiles a simple lambda expression.
+ */
+Datum (*llvm_prepare_simple_expression(ExprState *state))(Datum **)
+{
+	CompiledExprState *cstate = (CompiledExprState *) state->evalfunc_simple_private;
+	Datum (*func)(Datum**);
+
+	llvm_enter_fatal_on_oom();
+	func = (Datum (*)(Datum **)) llvm_get_function(cstate->context,
+												 cstate->funcname);
+	llvm_leave_fatal_on_oom();
+	Assert(func);
+	return func;
+}
+
 
 /*
  * Build information necessary for inlining external function references in
@@ -195,8 +425,9 @@ llvm_build_inline_plan(llvm::Module *mod)
 		FunctionInlineState inlineState = {};
 
 		/* already has a definition */
-		if (!funcDecl.isDeclaration())
+		if (!funcDecl.isDeclaration()) {
 			continue;
+		}
 
 		/* llvm provides implementation */
 		if (funcDecl.isIntrinsic())
@@ -211,6 +442,7 @@ llvm_build_inline_plan(llvm::Module *mod)
 		inlineState.allowReconsidering = false;
 		functionStates[funcDecl.getName()] = inlineState;
 	}
+
 
 	/*
 	 * Iterate over pending worklist items, look them up in index, check
@@ -256,13 +488,17 @@ llvm_build_inline_plan(llvm::Module *mod)
 			{
 				ilog(DEBUG1, "ineligibile to import %s due to summary",
 					 symbolName.data());
+				ilog(DEBUG1, "ineligibile to import %s due to summary\n",
+					 symbolName.data());
 				continue;
 			}
 #endif
 
-			if ((int) fs->instCount() > inlineState.costLimit)
+			if ((int) fs->instCount() > inlineState.costLimit && !(symbolName == "ExecEvalLambdaExpr" || symbolName == "ExecEvalFastParamExtern" || symbolName == "ExecEvalFastFieldSelect"))
 			{
 				ilog(DEBUG1, "ineligibile to import %s due to early threshold: %u vs %u",
+					 symbolName.data(), fs->instCount(), inlineState.costLimit);
+				ilog(DEBUG1, "ineligibile to import %s due to early threshold: %u vs %u\n",
 					 symbolName.data(), fs->instCount(), inlineState.costLimit);
 				inlineState.allowReconsidering = true;
 				continue;
@@ -360,6 +596,7 @@ llvm_build_inline_plan(llvm::Module *mod)
 	return globalsToInline;
 }
 
+
 /*
  * Perform the actual inlining of external functions (and their dependencies)
  * into mod.
@@ -368,6 +605,7 @@ static void
 llvm_execute_inline_plan(llvm::Module *mod, ImportMapTy *globalsToInline)
 {
 	llvm::IRMover Mover(*mod);
+	std::error_code EC;
 
 	for (const auto& toInline : *globalsToInline)
 	{
@@ -381,6 +619,7 @@ llvm_execute_inline_plan(llvm::Module *mod, ImportMapTy *globalsToInline)
 
 		if (modGlobalsToInline.empty())
 			continue;
+		
 
 		for (auto &glob: modGlobalsToInline)
 		{
@@ -389,11 +628,12 @@ llvm_execute_inline_plan(llvm::Module *mod, ImportMapTy *globalsToInline)
 			char *funcname;
 
 			llvm_split_symbol_name(SymbolName.data(), &modname, &funcname);
-
 			llvm::GlobalValue *valueToImport = importMod->getNamedValue(funcname);
 
 			if (!valueToImport)
 				elog(FATAL, "didn't refind value %s to import", SymbolName.data());
+
+			ilog(DEBUG1, "Inlining %s\n", funcname);
 
 			/*
 			 * For functions (global vars are only inlined if already static),
@@ -441,6 +681,10 @@ llvm_execute_inline_plan(llvm::Module *mod, ImportMapTy *globalsToInline)
 				 modPath.data(), SymbolName.data());
 
 		}
+
+
+	
+
 
 #if LLVM_VERSION_MAJOR > 4
 #define IRMOVE_PARAMS , /*IsPerformingImport=*/false
@@ -683,6 +927,7 @@ function_inlinable(llvm::Function &F,
 				inlineState.allowReconsidering = false;
 
 				functionStates[funcName] = inlineState;
+
 				worklist.push_back({funcName, searchpath});
 
 				ilog(DEBUG1,

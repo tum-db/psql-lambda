@@ -50,6 +50,8 @@ typedef Datum (*ExprStateEvalFunc) (struct ExprState *expression,
 									struct ExprContext *econtext,
 									bool *isNull);
 
+typedef Datum (*ExprStateSimpleEvalFunc) (Datum **params);
+
 /* Bits in ExprState->flags (see also execExpr.h for private flag bits): */
 /* expression is for use with ExecQual() */
 #define EEO_FLAG_IS_QUAL					(1 << 0)
@@ -85,12 +87,14 @@ typedef struct ExprState
 	 * different values depending on the complexity of the expression.
 	 */
 	ExprStateEvalFunc evalfunc;
+	ExprStateSimpleEvalFunc evalfunc_simple;
 
 	/* original expression tree, for debugging only */
 	Expr	   *expr;
 
 	/* private state for an evalfunc */
 	void	   *evalfunc_private;
+	void	   *evalfunc_simple_private;
 
 	/*
 	 * XXX: following fields only needed during "compilation" (ExecInitExpr);
@@ -108,6 +112,17 @@ typedef struct ExprState
 
 	Datum	   *innermost_domainval;
 	bool	   *innermost_domainnull;
+
+	/* Indicator for ExecEvalFastFieldSelect that input is a Datum array
+	 * rather than a HeapTupleHeader.
+	 */
+	bool       tupleDatumArray;
+
+	/* Indicates that an EEOP_CONST op should be inserted for all const
+	 * function call parameters (needed for simple JIT compiling).
+	 */
+	bool       load_consts_explicitly;
+	bool       fast_jit;
 } ExprState;
 
 
@@ -303,6 +318,7 @@ typedef struct ReturnSetInfo
 	Tuplestorestate *setResult; /* holds the complete returned tuple set */
 	TupleDesc	setDesc;		/* actual descriptor for returned tuples */
 } ReturnSetInfo;
+
 
 /* ----------------
  *		ProjectionInfo node information
@@ -576,6 +592,7 @@ typedef struct EState
 	 */
 	int			es_jit_flags;
 	struct JitContext *es_jit;
+	struct JitContext *es_jit_tmp;
 	struct JitInstrumentation *es_jit_worker_instr;
 } EState;
 
@@ -830,6 +847,7 @@ typedef struct SubPlanState
 	List	   *args;			/* states of argument expression(s) */
 	HeapTuple	curTuple;		/* copy of most recent tuple from subplan */
 	Datum		curArray;		/* most recent array from ARRAY() subplan */
+	Datum 	curTuplestore; 		/* most recent TypedTuplestore from lambdatable subplan */
 	/* these are used when hashing the subselect's output: */
 	TupleDesc	descRight;		/* subselect desc after projection */
 	ProjectionInfo *projLeft;	/* for projecting lefthand exprs */

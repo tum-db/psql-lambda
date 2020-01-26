@@ -90,7 +90,7 @@ ExecInitTableFunctionResult(Expr *expr,
 }
 
 /*
- *		ExecMakeTableFunctionResult
+ * ExecMakeTableFunctionResult
  *
  * Evaluate a table function, producing a materialized result in a Tuplestore
  * object.
@@ -819,10 +819,10 @@ ExecEvalFuncArgs(FunctionCallInfo fcinfo,
 	foreach(arg, argList)
 	{
 		ExprState  *argstate = (ExprState *) lfirst(arg);
-
 		fcinfo->arg[i] = ExecEvalExpr(argstate,
 									  econtext,
 									  &fcinfo->argnull[i]);
+
 		i++;
 	}
 

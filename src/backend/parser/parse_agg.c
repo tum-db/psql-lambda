@@ -523,6 +523,14 @@ check_agglevels_and_constraints(ParseState *pstate, Node *expr)
 
 			break;
 
+		case EXPR_KIND_LAMBDA_EXPRESSION:
+			if (isAgg)
+				err = _("aggregate functions are not allowed in lambda expressions");
+			else
+				err = _("grouping operations are not allowed in lambda expressions");
+
+			break;
+
 			/*
 			 * There is intentionally no default: case here, so that the
 			 * compiler will warn if we add a new ParseExprKind without
@@ -831,6 +839,9 @@ transformWindowFuncCall(ParseState *pstate, WindowFunc *wfunc,
 			break;
 		case EXPR_KIND_POLICY:
 			err = _("window functions are not allowed in policy expressions");
+			break;
+		case EXPR_KIND_LAMBDA_EXPRESSION:
+			err = _("window functions are not allowed in lambda expressions");
 			break;
 		case EXPR_KIND_HAVING:
 			errkind = true;

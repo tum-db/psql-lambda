@@ -64,6 +64,7 @@ typedef enum ParseExprKind
 	EXPR_KIND_FUNCTION_DEFAULT, /* default parameter value for function */
 	EXPR_KIND_INDEX_EXPRESSION, /* index expression */
 	EXPR_KIND_INDEX_PREDICATE,	/* index predicate */
+	EXPR_KIND_LAMBDA_EXPRESSION,/* lambda expression */
 	EXPR_KIND_ALTER_COL_TRANSFORM,	/* transform expr in ALTER COLUMN TYPE */
 	EXPR_KIND_EXECUTE_PARAMETER,	/* parameter value in EXECUTE */
 	EXPR_KIND_TRIGGER_WHEN,		/* WHEN condition in CREATE TRIGGER */
@@ -194,6 +195,9 @@ struct ParseState
 	bool		p_resolve_unknowns; /* resolve unknown-type SELECT outputs as
 									 * type text */
 
+	LambdaExpr *p_current_lambda;    /* lambda expr currently being parsed */
+	List 	   *p_current_ltis;      /* list of LambdaTableInfos for tablefunc
+									   currently being parsed */
 	QueryEnvironment *p_queryEnv;	/* curr env, incl refs to enclosing env */
 
 	/* Flags telling about things found in the query: */

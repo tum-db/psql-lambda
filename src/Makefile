@@ -19,6 +19,7 @@ SUBDIRS = \
 	backend \
 	backend/utils/mb/conversion_procs \
 	backend/snowball \
+	ext \
 	include \
 	interfaces \
 	backend/replication/libpqwalreceiver \

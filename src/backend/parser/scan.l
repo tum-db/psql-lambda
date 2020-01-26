@@ -494,6 +494,7 @@ other			.
 				}
 <xh><<EOF>>		{ yyerror("unterminated hexadecimal string literal"); }
 
+
 {xnstart}		{
 					/* National character.
 					 * We will pass this along as a normal character string,
@@ -1029,11 +1030,13 @@ other			.
 					keyword = ScanKeywordLookup(yytext,
 												yyextra->keywords,
 												yyextra->num_keywords);
+
 					if (keyword != NULL)
 					{
 						yylval->keyword = keyword->name;
 						return keyword->value;
 					}
+
 
 					/*
 					 * No.  Convert the identifier to lower case, and truncate

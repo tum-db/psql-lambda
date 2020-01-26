@@ -855,6 +855,15 @@ _outWindowAgg(StringInfo str, const WindowAgg *node)
 }
 
 static void
+_outLambdaExpr(StringInfo str, const LambdaExpr *node)
+{
+	WRITE_NODE_TYPE("LAMBDA");
+
+	WRITE_NODE_FIELD(args);
+	WRITE_NODE_FIELD(expr);
+}
+
+static void
 _outGroup(StringInfo str, const Group *node)
 {
 	int			i;
@@ -1196,6 +1205,7 @@ _outParam(StringInfo str, const Param *node)
 	WRITE_INT_FIELD(paramid);
 	WRITE_OID_FIELD(paramtype);
 	WRITE_INT_FIELD(paramtypmod);
+	WRITE_BOOL_FIELD(lambda);
 	WRITE_OID_FIELD(paramcollid);
 	WRITE_LOCATION_FIELD(location);
 }
@@ -3828,6 +3838,9 @@ outNode(StringInfo str, const void *obj)
 				break;
 			case T_WindowAgg:
 				_outWindowAgg(str, obj);
+				break;
+			case T_LambdaExpr:
+				_outLambdaExpr(str, obj);
 				break;
 			case T_Group:
 				_outGroup(str, obj);

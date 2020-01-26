@@ -996,7 +996,16 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		EEO_CASE(EEOP_PARAM_EXTERN)
 		{
 			/* out of line implementation: too large */
-			ExecEvalParamExtern(state, op, econtext);
+
+			if (op->d.param.lambda)
+			{
+				ExecEvalFastParamExtern(state, op, econtext);
+			}
+			else
+			{
+				ExecEvalParamExtern(state, op, econtext);
+			}
+
 			EEO_NEXT();
 		}
 
@@ -1355,7 +1364,16 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		EEO_CASE(EEOP_FIELDSELECT)
 		{
 			/* too complex for an inline implementation */
-			ExecEvalFieldSelect(state, op, econtext);
+
+			if (op->d.fieldselect.lambda)
+			{
+				ExecEvalFastFieldSelect(state, op, econtext);
+			}
+			else
+			{
+				ExecEvalFieldSelect(state, op, econtext);
+			}
+			
 
 			EEO_NEXT();
 		}
@@ -1786,6 +1804,53 @@ ExecInterpExprStillValid(ExprState *state, ExprContext *econtext, bool *isNull)
 	return state->evalfunc(state, econtext, isNull);
 }
 
+
+
+/*
+ * This function is just a dummy - calls to it must be replaced by a call to
+ * a JITed function which represents the lambda expression. This is the job
+ * of the LambdaInjectionPass.
+ */
+Datum
+ExecEvalLambdaExpr(ExprState *state, ExprContext *econtext, bool *isnull, int index) 
+{
+	(void) index;
+	(void) econtext;
+	(void) isnull;
+	(void) index;
+
+	ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("ExecEvalLambdaExpr was called, but this should not happen. " \
+				 "Please make sure that JIT is applied to the tablefunction. " \
+				 	"To evaluate a non-JIT lambda expression, please use the " \
+				 	"PG_LAMBDA_EVAL macro instead of PG_LAMBDA_INJECT.")));
+
+	return Int32GetDatum(0);
+}
+
+
+/*
+ * This function is just a dummy - calls to it must be replaced by a call to
+ * a JITed function which represents the simple lambda expression. This is the job
+ * of the LambdaInjectionPass.
+ */
+Datum
+ExecEvalSimpleLambdaExpr(Datum **args, int index) 
+{
+	(void) args;
+	(void) index;
+
+	ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("ExecEvalSimpleLambdaExpr was called, but this should not happen. " \
+				 "Please make sure that JIT is applied to the tablefunction. " \
+				 	"To evaluate a non-JIT lambda expression, please use the " \
+				 	"PG_LAMBDA_EVAL macro instead of PG_LAMBDA_INJECT.")));
+
+	return Int32GetDatum(0);
+}
+
 /*
  * Check that an expression is still valid in the face of potential schema
  * changes since the plan has been created.
@@ -1994,7 +2059,6 @@ static Datum
 ExecJustConst(ExprState *state, ExprContext *econtext, bool *isnull)
 {
 	ExprEvalStep *op = &state->steps[0];
-
 	*isnull = op->d.constval.isnull;
 	return op->d.constval.value;
 }
@@ -2294,6 +2358,22 @@ ExecEvalParamExtern(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 	ereport(ERROR,
 			(errcode(ERRCODE_UNDEFINED_OBJECT),
 			 errmsg("no value found for parameter %d", paramId)));
+}
+
+
+/*
+ * Evaluate a PARAM_EXTERN parameter, skipping all type checks and assuming
+ * to be inside a lambda expression.
+ */
+void
+ExecEvalFastParamExtern(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
+{
+	ParamListInfo paramInfo = econtext->ecxt_param_list_info;
+	int			paramId = op->d.param.paramid;
+		
+	*op->resvalue = paramInfo->params[paramId - 1].value;
+	*op->resnull = paramInfo->params[paramId - 1].isnull;
+	return;
 }
 
 /*
@@ -2893,46 +2973,58 @@ ExecEvalFieldSelect(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 	}
 	else
 	{
-		/* Get the composite datum and extract its type fields */
+		
 		tuple = DatumGetHeapTupleHeader(tupDatum);
 
-		tupType = HeapTupleHeaderGetTypeId(tuple);
-		tupTypmod = HeapTupleHeaderGetTypMod(tuple);
-
-		/* Lookup tupdesc if first time through or if type changes */
-		tupDesc = get_cached_rowtype(tupType, tupTypmod,
-									 &op->d.fieldselect.argdesc,
-									 econtext);
-
-		/*
-		 * Find field's attr record.  Note we don't support system columns
-		 * here: a datum tuple doesn't have valid values for most of the
-		 * interesting system columns anyway.
-		 */
-		if (fieldnum <= 0)		/* should never happen */
-			elog(ERROR, "unsupported reference to system column %d in FieldSelect",
-				 fieldnum);
-		if (fieldnum > tupDesc->natts)	/* should never happen */
-			elog(ERROR, "attribute number %d exceeds number of columns %d",
-				 fieldnum, tupDesc->natts);
-		attr = TupleDescAttr(tupDesc, fieldnum - 1);
-
-		/* Check for dropped column, and force a NULL result if so */
-		if (attr->attisdropped)
+		if (op->d.fieldselect.lambda)
 		{
-			*op->resnull = true;
-			return;
+			/*
+			 * If we are inside a lambda expression, we already know the TupleDesc
+			 * and can safely skip the (expensive) checks.
+			 */
+			tupDesc = op->d.fieldselect.argdesc;
 		}
+		else
+		{
+		/* Get the composite datum and extract its type fields */
 
-		/* Check for type mismatch --- possible after ALTER COLUMN TYPE? */
-		/* As in CheckVarSlotCompatibility, we should but can't check typmod */
-		if (op->d.fieldselect.resulttype != attr->atttypid)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("attribute %d has wrong type", fieldnum),
-					 errdetail("Table has type %s, but query expects %s.",
-							   format_type_be(attr->atttypid),
-							   format_type_be(op->d.fieldselect.resulttype))));
+			tupType = HeapTupleHeaderGetTypeId(tuple);
+			tupTypmod = HeapTupleHeaderGetTypMod(tuple);
+			/* Lookup tupdesc if first time through or if type changes */
+			tupDesc = get_cached_rowtype(tupType, tupTypmod,
+										 &op->d.fieldselect.argdesc,
+										 econtext);
+
+			/*
+			 * Find field's attr record.  Note we don't support system columns
+			 * here: a datum tuple doesn't have valid values for most of the
+			 * interesting system columns anyway.
+			 */
+			if (fieldnum <= 0)		/* should never happen */
+				elog(ERROR, "unsupported reference to system column %d in FieldSelect",
+					 fieldnum);
+			if (fieldnum > tupDesc->natts)	/* should never happen */
+				elog(ERROR, "attribute number %d exceeds number of columns %d",
+					 fieldnum, tupDesc->natts);
+			attr = TupleDescAttr(tupDesc, fieldnum - 1);
+
+			/* Check for dropped column, and force a NULL result if so */
+			if (attr->attisdropped)
+			{
+				*op->resnull = true;
+				return;
+			}
+
+			/* Check for type mismatch --- possible after ALTER COLUMN TYPE? */
+			/* As in CheckVarSlotCompatibility, we should but can't check typmod */
+			if (op->d.fieldselect.resulttype != attr->atttypid)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATATYPE_MISMATCH),
+						 errmsg("attribute %d has wrong type", fieldnum),
+						 errdetail("Table has type %s, but query expects %s.",
+								   format_type_be(attr->atttypid),
+								   format_type_be(op->d.fieldselect.resulttype))));
+		}		
 
 		/* heap_getattr needs a HeapTuple not a bare HeapTupleHeader */
 		tmptup.t_len = HeapTupleHeaderGetDatumLength(tuple);
@@ -2944,6 +3036,62 @@ ExecEvalFieldSelect(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 									 tupDesc,
 									 op->resnull);
 	}
+}
+
+
+void ExecEvalFastDatumExtract(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
+{
+	*op->resnull = false;
+	*op->resvalue = ((Datum *) DatumGetPointer(*op->resvalue))[op->d.fieldselect.fieldnum - 1];
+}
+
+
+/*
+ * Evaluate a FieldSelect node, skipping all type checks and assuming to be inside
+ * a lambda expression.
+ *
+ * Note: The input op->resvalue can either be 
+ */
+void
+ExecEvalFastFieldSelect(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
+{
+	if (state->tupleDatumArray)
+	{
+		*op->resnull = false;
+		*op->resvalue = ((Datum *) DatumGetPointer(*op->resvalue))[op->d.fieldselect.fieldnum - 1];
+	}
+	else
+	{
+		AttrNumber	fieldnum = op->d.fieldselect.fieldnum;
+		Datum		tupDatum;
+		HeapTupleHeader tuple;
+		Oid			tupType;
+		int32		tupTypmod;
+		TupleDesc	tupDesc;
+		Form_pg_attribute attr;
+		HeapTupleData tmptup;
+
+		/* NULL record -> NULL result */
+		if (*op->resnull)
+			return;
+
+		tupDatum = *op->resvalue;
+			
+		tuple = DatumGetHeapTupleHeader(tupDatum);
+		
+		tupDesc = op->d.fieldselect.argdesc;	
+
+		/* heap_getattr needs a HeapTuple not a bare HeapTupleHeader */
+		tmptup.t_len = HeapTupleHeaderGetDatumLength(tuple);
+		tmptup.t_data = tuple;
+
+		/* extract the field */
+		*op->resvalue = heap_getattr(&tmptup,
+									 fieldnum,
+									 tupDesc,
+									 op->resnull);
+	}
+		
 }
 
 /*

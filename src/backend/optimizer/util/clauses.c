@@ -3563,6 +3563,7 @@ eval_const_expressions_mutator(Node *node,
 				newfselect->fieldnum = fselect->fieldnum;
 				newfselect->resulttype = fselect->resulttype;
 				newfselect->resulttypmod = fselect->resulttypmod;
+				newfselect->lambda = fselect->lambda;
 				newfselect->resultcollid = fselect->resultcollid;
 				if (arg && IsA(arg, Const))
 				{

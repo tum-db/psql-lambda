@@ -32,7 +32,10 @@
 #include "access/htup_details.h"
 #include "executor/executor.h"
 #include "executor/nodeSubplan.h"
+#include "executor/tuptable.h"
+
 #include "nodes/makefuncs.h"
+
 #include "miscadmin.h"
 #include "optimizer/clauses.h"
 #include "utils/array.h"
@@ -235,6 +238,8 @@ ExecScanSubPlan(SubPlanState *node,
 	ListCell   *pvar;
 	ListCell   *l;
 	ArrayBuildStateAny *astate = NULL;
+	TypedTuplestore *tts = NULL;
+	Tuplestorestate *tupstorestate;
 
 	/*
 	 * MULTIEXPR subplans, when "executed", just return NULL; but first we
@@ -267,6 +272,14 @@ ExecScanSubPlan(SubPlanState *node,
 		astate = initArrayResultAny(subplan->firstColType,
 									CurrentMemoryContext, true);
 
+
+	if (subLinkType == FUNC_SUBLINK) {
+		tts = palloc(sizeof(TypedTuplestore));
+		tupstorestate = tuplestore_begin_heap(false, false, work_mem);
+		tts->tuplestorestate = tupstorestate;
+		tts->tupledesc = NULL;
+	}
+
 	/*
 	 * We are probably in a short-lived expression-evaluation context. Switch
 	 * to the per-query context for manipulating the child plan's chgParam,
@@ -291,7 +304,6 @@ ExecScanSubPlan(SubPlanState *node,
 											   &(prm->isnull));
 		planstate->chgParam = bms_add_member(planstate->chgParam, paramid);
 	}
-
 	/*
 	 * Now that we've set up its parameters, we can reset the subplan.
 	 */
@@ -320,6 +332,13 @@ ExecScanSubPlan(SubPlanState *node,
 	 */
 	result = BoolGetDatum(subLinkType == ALL_SUBLINK);
 	*isNull = false;
+
+
+	if (subLinkType == CURSOR_SUBLINK)
+	{
+		MemoryContextSwitchTo(oldcontext);
+		return PointerGetDatum(planstate);
+	}
 
 	for (slot = ExecProcNode(planstate);
 		 !TupIsNull(slot);
@@ -376,6 +395,19 @@ ExecScanSubPlan(SubPlanState *node,
 			astate = accumArrayResultAny(astate, dvalue, disnull,
 										 subplan->firstColType, oldcontext);
 			/* keep scanning subplan to collect all values */
+			continue;
+		}
+
+		else if (subLinkType == FUNC_SUBLINK)
+		{
+			tuplestore_puttupleslot(tupstorestate, slot);
+			found = true;
+
+			if(tts->tupledesc == NULL)
+			{
+				tts->tupledesc = tdesc;
+			}
+
 			continue;
 		}
 
@@ -445,6 +477,11 @@ ExecScanSubPlan(SubPlanState *node,
 	{
 		/* We return the result in the caller's context */
 		result = makeArrayResultAny(astate, oldcontext, true);
+	}
+	else if (subLinkType == FUNC_SUBLINK)
+	{
+
+		result = PointerGetDatum(tts);
 	}
 	else if (!found)
 	{
@@ -806,6 +843,7 @@ ExecInitSubPlan(SubPlan *subplan, PlanState *parent)
 	 */
 	sstate->curTuple = NULL;
 	sstate->curArray = PointerGetDatum(NULL);
+	sstate->curTuplestore = PointerGetDatum(NULL);
 	sstate->projLeft = NULL;
 	sstate->projRight = NULL;
 	sstate->hashtable = NULL;
@@ -1045,6 +1083,8 @@ ExecSetParamPlan(SubPlanState *node, ExprContext *econtext)
 	ListCell   *l;
 	bool		found = false;
 	ArrayBuildStateAny *astate = NULL;
+	Tuplestorestate *tupstorestate;
+	TypedTuplestore *tts;
 
 	if (subLinkType == ANY_SUBLINK ||
 		subLinkType == ALL_SUBLINK)
@@ -1067,6 +1107,14 @@ ExecSetParamPlan(SubPlanState *node, ExprContext *econtext)
 	 * Must switch to per-query memory context.
 	 */
 	oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
+
+	if (subLinkType == FUNC_SUBLINK)
+	{
+		tupstorestate = tuplestore_begin_heap(false, false, work_mem);
+		tts = palloc(sizeof(TypedTuplestore));
+		tts->tuplestorestate = tupstorestate;
+		tts->tupledesc = NULL;
+	}
 
 	/*
 	 * Set Params of this plan from parent plan correlation values. (Any
@@ -1127,6 +1175,19 @@ ExecSetParamPlan(SubPlanState *node, ExprContext *econtext)
 			continue;
 		}
 
+		if (subLinkType == FUNC_SUBLINK)
+		{
+			tuplestore_puttupleslot(tupstorestate, slot);
+			found = true;
+
+			if(tts->tupledesc == NULL)
+			{
+				tts->tupledesc = tdesc;
+			}
+
+			continue;
+		}
+
 		if (found &&
 			(subLinkType == EXPR_SUBLINK ||
 			 subLinkType == MULTIEXPR_SUBLINK ||
@@ -1180,6 +1241,25 @@ ExecSetParamPlan(SubPlanState *node, ExprContext *econtext)
 											true);
 		prm->execPlan = NULL;
 		prm->value = node->curArray;
+		prm->isnull = false;
+	}
+	else if (subLinkType == FUNC_SUBLINK)
+	{
+		/* There can be only one setParam... */
+		int			paramid = linitial_int(subplan->setParam);
+		ParamExecData *prm = &(econtext->ecxt_param_exec_vals[paramid]);
+
+		/*
+		 * We build the result tuplestore in query context so it won't disappear;
+		 * to avoid leaking memory across repeated calls, we have to remember
+		 * the latest value, much as for curTuple above.
+		 */
+		if (node->curTuplestore != PointerGetDatum(NULL))
+			tuplestore_end(((TypedTuplestore *) node->curTuplestore)->tuplestorestate);
+		node->curTuplestore = PointerGetDatum(tts);
+
+		prm->execPlan = NULL;
+		prm->value = node->curTuplestore;
 		prm->isnull = false;
 	}
 	else if (!found)
